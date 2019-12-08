@@ -1,8 +1,5 @@
 use ash::extensions::khr::XlibSurface;
-use ash::extensions::{
-    ext::DebugReport,
-    khr::Surface,
-};
+use ash::extensions::{ext::DebugReport, khr::Surface};
 use ash::version::{EntryV1_0, InstanceV1_0};
 use ash::{vk, vk_make_version, Entry};
 use std::ffi::CString;
@@ -35,11 +32,14 @@ pub fn main() {
 
     // create instance
     let app_info = vk::ApplicationInfo {
-        api_version: vk_make_version!(1, 0, 0),
+        api_version: vk_make_version!(1, 1, 0),
         ..Default::default()
     };
 
-    let layer_names = [CString::new("VK_LAYER_LUNARG_standard_validation").unwrap()];
+    let layer_names = [
+        CString::new("VK_LAYER_LUNARG_standard_validation").unwrap(),
+        CString::new("VK_LAYER_KHRONOS_validation").unwrap(),
+    ];
     let layers_names_raw: Vec<*const i8> = layer_names
         .iter()
         .map(|raw_name| raw_name.as_ptr())
@@ -71,6 +71,8 @@ pub fn main() {
     }
 
     dbg![entry.enumerate_instance_extension_properties().unwrap()];
+
+    dbg![entry.enumerate_instance_layer_properties().unwrap()];
 }
 
 fn extension_names() -> Vec<*const i8> {
