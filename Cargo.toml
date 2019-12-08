@@ -8,3 +8,6 @@ edition = "2018"
 winit = "0.19"
 image = "0.10.4"
 ash = "0.29.0"
+
+[profile.release]
+debug = true

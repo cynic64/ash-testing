@@ -287,22 +287,6 @@ fn main() {
             rasterization_samples: vk::SampleCountFlags::TYPE_1,
             ..Default::default()
         };
-        let noop_stencil_state = vk::StencilOpState {
-            fail_op: vk::StencilOp::KEEP,
-            pass_op: vk::StencilOp::KEEP,
-            depth_fail_op: vk::StencilOp::KEEP,
-            compare_op: vk::CompareOp::ALWAYS,
-            ..Default::default()
-        };
-        let depth_state_info = vk::PipelineDepthStencilStateCreateInfo {
-            depth_test_enable: 1,
-            depth_write_enable: 1,
-            depth_compare_op: vk::CompareOp::LESS_OR_EQUAL,
-            front: noop_stencil_state,
-            back: noop_stencil_state,
-            max_depth_bounds: 1.0,
-            ..Default::default()
-        };
         let color_blend_attachment_states = [vk::PipelineColorBlendAttachmentState {
             blend_enable: 0,
             src_color_blend_factor: vk::BlendFactor::SRC_COLOR,
@@ -417,17 +401,22 @@ fn main() {
                 },
             );
             //let mut present_info_err = mem::zeroed();
-            let wait_semaphors = [base.rendering_complete_semaphore];
+            let wait_semaphores = [base.rendering_complete_semaphore];
             let swapchains = [base.swapchain];
             let image_indices = [present_index];
             let present_info = vk::PresentInfoKHR::builder()
-                .wait_semaphores(&wait_semaphors) // &base.rendering_complete_semaphore)
+                .wait_semaphores(&wait_semaphores)
                 .swapchains(&swapchains)
                 .image_indices(&image_indices);
 
-            base.swapchain_loader
-                .queue_present(base.present_queue, &present_info)
-                .unwrap();
+            let present_result = base.swapchain_loader
+                .queue_present(base.present_queue, &present_info);
+
+            match present_result {
+                Ok(_) => {},
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => panic!("Swapchain out of date!"),
+                Err(e) => println!("{:?}", e),
+            }
         });
 
         base.device.device_wait_idle().unwrap();
