@@ -293,6 +293,19 @@ impl ExampleBase {
         use winit::*;
 
         loop {
+            let mut exit = false;
+            self.events_loop.borrow_mut().poll_events(|ev| {
+                match ev {
+                    Event::WindowEvent {
+                        event: WindowEvent::CloseRequested,
+                        ..
+                    } => exit = true,
+                    _ => {},
+                }
+            });
+
+            if exit { break }
+
             f();
         }
         /*
