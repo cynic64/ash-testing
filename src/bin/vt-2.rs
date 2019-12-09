@@ -56,7 +56,7 @@ pub fn main() {
         flags: vk::DebugUtilsMessengerCreateFlagsEXT::empty(),
         message_severity: vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
             | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
-            | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
+            // | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
             | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
         message_type: vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
             | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
@@ -87,22 +87,8 @@ pub fn main() {
             .expect("Debug Utils Callback")
     };
 
-    // print info about instance
     unsafe {
-        instance
-            .enumerate_physical_devices()
-            .unwrap()
-            .iter()
-            .for_each(|dev| {
-                dbg![instance.get_physical_device_properties(*dev)];
-            });
-    }
-
-    dbg![entry.enumerate_instance_extension_properties().unwrap()];
-
-    dbg![entry.enumerate_instance_layer_properties().unwrap()];
-
-    unsafe {
+        debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
         instance.destroy_instance(None);
     }
 }
