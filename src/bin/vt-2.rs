@@ -1,8 +1,9 @@
 use ash::extensions::khr::XlibSurface;
 use ash::extensions::{ext::DebugUtils, khr::Surface};
-use ash::version::{EntryV1_0, InstanceV1_0};
+use ash::version::{EntryV1_0, InstanceV1_0, DeviceV1_0};
 use ash::{vk, vk_make_version, Entry};
 
+use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::ptr;
@@ -99,11 +100,38 @@ pub fn main() {
         phys_devs[0]
     };
 
-    dbg![unsafe { instance.get_physical_device_properties(physical_device) }];
-    dbg![unsafe { instance.get_physical_device_features(physical_device) }];
+    // get queue family index
+    let queue_family_index = {
+        let queues =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+
+        queues
+            .iter()
+            .enumerate()
+            .find(|(_idx, queue)| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            .expect("Couldn't find a graphics queue")
+            .0
+    };
+
+    // get logical device
+    let device_queue_create_info = vk::DeviceQueueCreateInfo::builder()
+        .queue_family_index(queue_family_index.try_into().unwrap())
+        .queue_priorities(&[1.0])
+        .build();
+
+    let device_create_info = vk::DeviceCreateInfo::builder()
+        .queue_create_infos(&[device_queue_create_info])
+        .build();
+
+    let device = unsafe {
+        instance
+            .create_device(physical_device, &device_create_info, None)
+            .expect("Couldn't create device")
+    };
 
     // destroy objects
     unsafe {
+        device.destroy_device(None);
         debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
         instance.destroy_instance(None);
     }
