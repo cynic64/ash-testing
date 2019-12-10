@@ -13,7 +13,7 @@ use winit::{Event, WindowEvent};
 pub fn main() {
     // create winit window
     let mut events_loop = winit::EventsLoop::new();
-    let _window = winit::WindowBuilder::new()
+    let window = winit::WindowBuilder::new()
         .with_title("Ash - Example")
         .build(&events_loop)
         .unwrap();
@@ -88,6 +88,12 @@ pub fn main() {
             .expect("Debug Utils Callback")
     };
 
+    // create surface
+    let surface = unsafe { create_surface(&entry, &instance, &window) }
+        .expect("couldn't create surface");
+
+    let surface_loader = ash::extensions::khr::Surface::new(&entry, &instance);
+
     // get physical device
     let physical_device = {
         let phys_devs = unsafe { instance.enumerate_physical_devices() }
@@ -101,7 +107,7 @@ pub fn main() {
     };
 
     // get queue family index
-    let queue_family_index = {
+    let queue_family_index: u32 = {
         let queues =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
 
@@ -111,11 +117,13 @@ pub fn main() {
             .find(|(_idx, queue)| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS))
             .expect("Couldn't find a graphics queue")
             .0
+            .try_into()
+            .unwrap()
     };
 
     // get logical device
     let device_queue_create_info = vk::DeviceQueueCreateInfo::builder()
-        .queue_family_index(queue_family_index.try_into().unwrap())
+        .queue_family_index(queue_family_index)
         .queue_priorities(&[1.0])
         .build();
 
@@ -129,9 +137,13 @@ pub fn main() {
             .expect("Couldn't create device")
     };
 
+    // get queue (0 = take first queue)
+    let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+
     // destroy objects
     unsafe {
         device.destroy_device(None);
+        surface_loader.destroy_surface(surface, None);
         debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
         instance.destroy_instance(None);
     }
@@ -168,4 +180,25 @@ unsafe extern "system" fn vulkan_debug_utils_callback(
     println!("[Debug]{}{}{:?}", severity, types, message);
 
     vk::FALSE
+}
+
+// only works on linux
+pub unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
+    entry: &E,
+    instance: &I,
+    window: &winit::Window,
+) -> Result<vk::SurfaceKHR, vk::Result> {
+    use winit::os::unix::WindowExt;
+
+    let x11_display = window.get_xlib_display().unwrap();
+    let x11_window = window.get_xlib_window().unwrap();
+    let x11_create_info = vk::XlibSurfaceCreateInfoKHR {
+        s_type: vk::StructureType::XLIB_SURFACE_CREATE_INFO_KHR,
+        p_next: ptr::null(),
+        flags: Default::default(),
+        window: x11_window as vk::Window,
+        dpy: x11_display as *mut vk::Display,
+    };
+    let xlib_surface_loader = XlibSurface::new(entry, instance);
+    xlib_surface_loader.create_xlib_surface(&x11_create_info, None)
 }
