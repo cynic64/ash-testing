@@ -99,7 +99,6 @@ pub fn main() {
     }
 
     dbg![entry.enumerate_instance_extension_properties().unwrap()];
-
     dbg![entry.enumerate_instance_layer_properties().unwrap()];
 
     unsafe {

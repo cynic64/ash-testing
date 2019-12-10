@@ -87,6 +87,22 @@ pub fn main() {
             .expect("Debug Utils Callback")
     };
 
+    // get physical device
+    let physical_device = {
+        let phys_devs = unsafe { instance.enumerate_physical_devices() }
+            .expect("Couldn't enumerate physical devices");
+
+        if phys_devs.len() < 1 {
+            panic!("No physical devices available!");
+        }
+
+        phys_devs[0]
+    };
+
+    dbg![unsafe { instance.get_physical_device_properties(physical_device) }];
+    dbg![unsafe { instance.get_physical_device_features(physical_device) }];
+
+    // destroy objects
     unsafe {
         debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
         instance.destroy_instance(None);
