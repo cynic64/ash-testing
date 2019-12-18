@@ -10,8 +10,6 @@ use std::ptr;
 
 use winit::{Event, WindowEvent};
 
-pub const DEVICE_EXTENSIONS: [&str; 1] = ["VK_KHR_swapchain"];
-
 pub fn main() {
     // create winit window
     let mut events_loop = winit::EventsLoop::new();
@@ -30,6 +28,7 @@ pub fn main() {
         CString::new("VK_LAYER_LUNARG_standard_validation").unwrap(),
         CString::new("VK_LAYER_KHRONOS_validation").unwrap(),
     ];
+
     let layers_names_raw: Vec<*const i8> = layer_names
         .iter()
         .map(|raw_name| raw_name.as_ptr())
@@ -124,6 +123,7 @@ pub fn main() {
 
     let device_create_info = vk::DeviceCreateInfo::builder()
         .queue_create_infos(&[device_queue_create_info])
+        .enabled_extension_names(&get_device_extensions_raw())
         .build();
 
     let device = unsafe {
@@ -207,7 +207,7 @@ fn is_phys_dev_suitable(instance: &ash::Instance, phys_dev: &vk::PhysicalDevice)
         .collect();
 
     // make sure all required device extensions are supported by this device
-    DEVICE_EXTENSIONS.iter().for_each(|name| {
+    get_device_extensions().iter().for_each(|name| {
         available_extension_names
             .iter()
             .find(|ext| ext == name)
@@ -239,7 +239,7 @@ unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
 }
 
 /// Helper function to convert [c_char; SIZE] to string
-pub fn vk_to_string(raw_string_array: &[c_char]) -> String {
+fn vk_to_string(raw_string_array: &[c_char]) -> String {
     // Implementation 1
     //    let end = '\0' as u8;
     //
@@ -268,4 +268,14 @@ pub fn vk_to_string(raw_string_array: &[c_char]) -> String {
         .to_str()
         .expect("Failed to convert vulkan raw string.")
         .to_owned()
+}
+
+fn get_device_extensions<'a>() -> [&'a str; 1] {
+    ["VK_KHR_swapchain"]
+}
+
+fn get_device_extensions_raw() -> [*const c_char; 1] {
+    [
+        ash::extensions::khr::Swapchain::name().as_ptr()
+    ]
 }
