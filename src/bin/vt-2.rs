@@ -1,14 +1,16 @@
 use ash::extensions::khr::XlibSurface;
 use ash::extensions::{ext::DebugUtils, khr::Surface};
-use ash::version::{EntryV1_0, InstanceV1_0, DeviceV1_0};
+use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
 use ash::{vk, vk_make_version, Entry};
 
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
-use std::os::raw::c_void;
+use std::os::raw::{c_void, c_char};
 use std::ptr;
 
 use winit::{Event, WindowEvent};
+
+pub const DEVICE_EXTENSIONS: [&str; 1] = ["VK_KHR_swapchain"];
 
 pub fn main() {
     // create winit window
@@ -17,22 +19,6 @@ pub fn main() {
         .with_title("Ash - Example")
         .build(&events_loop)
         .unwrap();
-
-    loop {
-        let mut exit = false;
-
-        events_loop.poll_events(|ev| match ev {
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => exit = true,
-            _ => {}
-        });
-
-        if exit {
-            break;
-        }
-    }
 
     // create instance
     let app_info = vk::ApplicationInfo {
@@ -89,8 +75,8 @@ pub fn main() {
     };
 
     // create surface
-    let surface = unsafe { create_surface(&entry, &instance, &window) }
-        .expect("couldn't create surface");
+    let surface =
+        unsafe { create_surface(&entry, &instance, &window) }.expect("couldn't create surface");
 
     let surface_loader = ash::extensions::khr::Surface::new(&entry, &instance);
 
@@ -99,11 +85,10 @@ pub fn main() {
         let phys_devs = unsafe { instance.enumerate_physical_devices() }
             .expect("Couldn't enumerate physical devices");
 
-        if phys_devs.len() < 1 {
-            panic!("No physical devices available!");
-        }
-
-        phys_devs[0]
+        *phys_devs
+            .iter()
+            .find(|phys_dev| is_phys_dev_suitable(&instance, phys_dev))
+            .expect("No suitable physical device found!")
     };
 
     // get queue family index
@@ -120,6 +105,16 @@ pub fn main() {
             .try_into()
             .unwrap()
     };
+
+    if !unsafe {
+        surface_loader.get_physical_device_surface_support(
+            physical_device,
+            queue_family_index,
+            surface,
+        )
+    } {
+        panic!("Queue does not have surface support! It's possible that a separate queue with surface support exists, but the current implementation is not capable of finding one.");
+    }
 
     // get logical device
     let device_queue_create_info = vk::DeviceQueueCreateInfo::builder()
@@ -140,6 +135,22 @@ pub fn main() {
     // get queue (0 = take first queue)
     let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
+    loop {
+        let mut exit = false;
+
+        events_loop.poll_events(|ev| match ev {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => exit = true,
+            _ => {}
+        });
+
+        if exit {
+            break;
+        }
+    }
+
     // destroy objects
     unsafe {
         device.destroy_device(None);
@@ -150,6 +161,7 @@ pub fn main() {
 }
 
 fn extension_names() -> Vec<*const i8> {
+    // these are instance extensions
     vec![
         Surface::name().as_ptr(),
         XlibSurface::name().as_ptr(),
@@ -182,8 +194,31 @@ unsafe extern "system" fn vulkan_debug_utils_callback(
     vk::FALSE
 }
 
+fn is_phys_dev_suitable(instance: &ash::Instance, phys_dev: &vk::PhysicalDevice) -> bool {
+    // gets a list of extensions supported by this device as vulkan strings,
+    // which don't implement PartialEq
+    let extension_properties = unsafe { instance.enumerate_device_extension_properties(*phys_dev) }
+        .expect("Couldn't enumerate device extension properties!");
+
+    // Now convert them into rust strings
+    let available_extension_names: Vec<String> = extension_properties
+        .iter()
+        .map(|ext| vk_to_string(&ext.extension_name))
+        .collect();
+
+    // make sure all required device extensions are supported by this device
+    DEVICE_EXTENSIONS.iter().for_each(|name| {
+        available_extension_names
+            .iter()
+            .find(|ext| ext == name)
+            .expect(&format!("Couldn't find extension {}", name));
+    });
+
+    true
+}
+
 // only works on linux
-pub unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
+unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     entry: &E,
     instance: &I,
     window: &winit::Window,
@@ -201,4 +236,36 @@ pub unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     };
     let xlib_surface_loader = XlibSurface::new(entry, instance);
     xlib_surface_loader.create_xlib_surface(&x11_create_info, None)
+}
+
+/// Helper function to convert [c_char; SIZE] to string
+pub fn vk_to_string(raw_string_array: &[c_char]) -> String {
+    // Implementation 1
+    //    let end = '\0' as u8;
+    //
+    //    let mut content: Vec<u8> = vec![];
+    //
+    //    for ch in raw_string_array.iter() {
+    //        let ch = (*ch) as u8;
+    //
+    //        if ch != end {
+    //            content.push(ch);
+    //        } else {
+    //            break
+    //        }
+    //    }
+    //
+    //    String::from_utf8(content)
+    //        .expect("Failed to convert vulkan raw string")
+
+    // Implementation 2
+    let raw_string = unsafe {
+        let pointer = raw_string_array.as_ptr();
+        CStr::from_ptr(pointer)
+    };
+
+    raw_string
+        .to_str()
+        .expect("Failed to convert vulkan raw string.")
+        .to_owned()
 }
