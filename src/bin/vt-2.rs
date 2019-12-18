@@ -5,7 +5,7 @@ use ash::{vk, vk_make_version, Entry};
 
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_void, c_char};
+use std::os::raw::{c_char, c_void};
 use std::ptr;
 
 use winit::{Event, WindowEvent};
@@ -135,6 +135,10 @@ pub fn main() {
     // get queue (0 = take first queue)
     let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
+    // check device swapchain capabilties (not just that it has the extension,
+    // also formats and stuff like that)
+    check_device_swapchain_caps(&surface_loader, physical_device, surface);
+
     loop {
         let mut exit = false;
 
@@ -217,6 +221,35 @@ fn is_phys_dev_suitable(instance: &ash::Instance, phys_dev: &vk::PhysicalDevice)
     true
 }
 
+fn check_device_swapchain_caps(
+    surface_loader: &Surface,
+    physical_device: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+) {
+    let capabilities = unsafe {
+        surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
+    }
+    .expect("Couldn't get physical device surface capabilities");
+
+    let formats =
+        unsafe { surface_loader.get_physical_device_surface_formats(physical_device, surface) }
+            .expect("Couldn't get physical device surface formats");
+
+    let present_modes = unsafe {
+        surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
+    }
+    .expect("Couldn't get physical device surface present modes");
+
+    assert!(capabilities.min_image_count <= 2 && capabilities.max_image_count >= 2);
+
+    formats
+        .iter()
+        .find(|fmt| fmt.format == vk::Format::B8G8R8A8_UNORM)
+        .expect("Swapchain doesn't support B8G8R8A8_UNORM!");
+
+    assert!(present_modes.contains(&vk::PresentModeKHR::IMMEDIATE));
+}
+
 // only works on linux
 unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     entry: &E,
@@ -240,24 +273,6 @@ unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
 
 /// Helper function to convert [c_char; SIZE] to string
 fn vk_to_string(raw_string_array: &[c_char]) -> String {
-    // Implementation 1
-    //    let end = '\0' as u8;
-    //
-    //    let mut content: Vec<u8> = vec![];
-    //
-    //    for ch in raw_string_array.iter() {
-    //        let ch = (*ch) as u8;
-    //
-    //        if ch != end {
-    //            content.push(ch);
-    //        } else {
-    //            break
-    //        }
-    //    }
-    //
-    //    String::from_utf8(content)
-    //        .expect("Failed to convert vulkan raw string")
-
     // Implementation 2
     let raw_string = unsafe {
         let pointer = raw_string_array.as_ptr();
@@ -275,7 +290,5 @@ fn get_device_extensions<'a>() -> [&'a str; 1] {
 }
 
 fn get_device_extensions_raw() -> [*const c_char; 1] {
-    [
-        ash::extensions::khr::Swapchain::name().as_ptr()
-    ]
+    [ash::extensions::khr::Swapchain::name().as_ptr()]
 }
