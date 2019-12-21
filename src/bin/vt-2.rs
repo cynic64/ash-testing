@@ -1,4 +1,4 @@
-use ash::extensions::khr::XlibSurface;
+use ash::extensions::khr::{Swapchain, XlibSurface};
 use ash::extensions::{ext::DebugUtils, khr::Surface};
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
 use ash::{vk, vk_make_version, Entry};
@@ -137,7 +137,31 @@ pub fn main() {
 
     // check device swapchain capabilties (not just that it has the extension,
     // also formats and stuff like that)
-    check_device_swapchain_caps(&surface_loader, physical_device, surface);
+    // also returns what dimensions the swapchain should initially be created at
+    let starting_dims = check_device_swapchain_caps(&surface_loader, physical_device, surface);
+
+    // create swapchain
+    let sc_format = vk::SurfaceFormatKHR {
+        format: vk::Format::B8G8R8A8_UNORM,
+        color_space: vk::ColorSpaceKHR::default(),
+    };
+
+    let sc_present_mode = vk::PresentModeKHR::IMMEDIATE;
+
+    let sc_create_info = vk::SwapchainCreateInfoKHR::builder()
+        .min_image_count(3)
+        .image_format(vk::Format::B8G8R8A8_UNORM)
+        .present_mode(vk::PresentModeKHR::IMMEDIATE)
+        .surface(surface)
+        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+        .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+        .image_array_layers(1)
+        .image_extent(starting_dims);
+
+    let swapchain_creator = Swapchain::new(&instance, &device);
+    let swapchain = unsafe { swapchain_creator.create_swapchain(&sc_create_info, None) }
+        .expect("Couldn't create swapchain");
 
     loop {
         let mut exit = false;
@@ -157,6 +181,7 @@ pub fn main() {
 
     // destroy objects
     unsafe {
+        swapchain_creator.destroy_swapchain(swapchain, None);
         device.destroy_device(None);
         surface_loader.destroy_surface(surface, None);
         debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
@@ -225,7 +250,9 @@ fn check_device_swapchain_caps(
     surface_loader: &Surface,
     physical_device: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
-) {
+) -> vk::Extent2D {
+    // returns the current dimensions of the swapchain
+
     let capabilities = unsafe {
         surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
     }
@@ -240,7 +267,9 @@ fn check_device_swapchain_caps(
     }
     .expect("Couldn't get physical device surface present modes");
 
-    assert!(capabilities.min_image_count <= 2 && capabilities.max_image_count >= 2);
+    // we will request 3 swapchain images to avoid having to wait while one is
+    // being cleared or something, idk exactly
+    assert!(capabilities.min_image_count <= 3 && capabilities.max_image_count >= 3);
 
     formats
         .iter()
@@ -248,6 +277,8 @@ fn check_device_swapchain_caps(
         .expect("Swapchain doesn't support B8G8R8A8_UNORM!");
 
     assert!(present_modes.contains(&vk::PresentModeKHR::IMMEDIATE));
+
+    capabilities.current_extent
 }
 
 // only works on linux
