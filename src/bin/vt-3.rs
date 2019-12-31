@@ -7,6 +7,7 @@ use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::ptr;
+use std::path::{Path, PathBuf};
 
 use winit::{Event, WindowEvent};
 
@@ -188,6 +189,13 @@ pub fn main() {
         })
         .collect();
 
+    // shaders
+    let frag_code = read_shader_code(&relative_path("shaders/vt-3/triangle.frag.spv"));
+    let vert_code = read_shader_code(&relative_path("shaders/vt-3/triangle.vert.spv"));
+
+    let frag_module = create_shader_module(&device, frag_code);
+    let vert_module = create_shader_module(&device, vert_code);
+
     loop {
         let mut exit = false;
 
@@ -207,10 +215,27 @@ pub fn main() {
     // destroy objects
     unsafe {
         swapchain_creator.destroy_swapchain(swapchain, None);
+        device.destroy_shader_module(frag_module, None);
+        device.destroy_shader_module(vert_module, None);
         device.destroy_device(None);
         surface_loader.destroy_surface(surface, None);
         debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
         instance.destroy_instance(None);
+    }
+}
+
+fn create_shader_module<D: DeviceV1_0>(device: &D, code: Vec<u8>) -> vk::ShaderModule {
+    use ash::util::read_spv;
+    use std::io::Cursor;
+
+    let readable_code = read_spv(&mut Cursor::new(&code)).expect("Couldn't read SPV");
+    let shader_module_create_info = vk::ShaderModuleCreateInfo::builder()
+        .code(&readable_code)
+        .build();
+
+    unsafe {
+        device.create_shader_module(&shader_module_create_info, None)
+            .expect("Couldn't create shader module")
     }
 }
 
@@ -306,6 +331,8 @@ fn check_device_swapchain_caps(
     capabilities.current_extent
 }
 
+// many of these functions are ripped from https://github.com/bwasty/vulkan-tutorial-rs
+
 // only works on linux
 unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     entry: &E,
@@ -347,4 +374,19 @@ fn get_device_extensions<'a>() -> [&'a str; 1] {
 
 fn get_device_extensions_raw() -> [*const c_char; 1] {
     [ash::extensions::khr::Swapchain::name().as_ptr()]
+}
+
+fn read_shader_code(shader_path: &Path) -> Vec<u8> {
+    use std::fs::File;
+    use std::io::Read;
+
+    let spv_file = File::open(shader_path)
+        .expect(&format!("Failed to find spv file at {:?}", shader_path));
+    let bytes_code: Vec<u8> = spv_file.bytes().filter_map(|byte| byte.ok()).collect();
+
+    bytes_code
+}
+
+pub fn relative_path(local_path: &str) -> PathBuf {
+    [env!("CARGO_MANIFEST_DIR"), local_path].iter().collect()
 }

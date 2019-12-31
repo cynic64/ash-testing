@@ -186,8 +186,8 @@ fn main() {
             .bind_buffer_memory(vertex_input_buffer, vertex_input_buffer_memory, 0)
             .unwrap();
         let mut vertex_spv_file =
-            Cursor::new(&include_bytes!("../../shader/triangle/triangle.vert.spv")[..]);
-        let mut frag_spv_file = Cursor::new(&include_bytes!("../../shader/triangle/triangle.frag.spv")[..]);
+            Cursor::new(&include_bytes!("../../shaders/triangle/triangle.vert.spv")[..]);
+        let mut frag_spv_file = Cursor::new(&include_bytes!("../../shaders/triangle/triangle.frag.spv")[..]);
 
         let vertex_code =
             read_spv(&mut vertex_spv_file).expect("Failed to read vertex shader spv file");
