@@ -6,8 +6,8 @@ use ash::{vk, vk_make_version, Entry};
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
-use std::ptr;
 use std::path::{Path, PathBuf};
+use std::ptr;
 
 use winit::{Event, WindowEvent};
 
@@ -196,6 +196,95 @@ pub fn main() {
     let frag_module = create_shader_module(&device, frag_code);
     let vert_module = create_shader_module(&device, vert_code);
 
+    let vert_stage_info = vk::PipelineShaderStageCreateInfo::builder()
+        .stage(vk::ShaderStageFlags::VERTEX)
+        .module(vert_module)
+        .name(&CString::new("main").unwrap())
+        .build();
+
+    let frag_stage_info = vk::PipelineShaderStageCreateInfo::builder()
+        .stage(vk::ShaderStageFlags::FRAGMENT)
+        .module(frag_module)
+        .name(&CString::new("main").unwrap())
+        .build();
+
+    let shader_stages = [vert_stage_info, frag_stage_info];
+
+    // fixed-function pipeline settings
+
+    // a.k.a vertex format
+    // we don't reallt have a format since they are hard-coded into the vertex
+    // shader for now
+    let pipeline_vertex_input_info = vk::PipelineVertexInputStateCreateInfo::builder().build();
+
+    let pipeline_input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::builder()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+        .build();
+
+    let viewport = vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: starting_dims.width as f32,
+        height: starting_dims.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    };
+
+    let scissors = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: starting_dims,
+    };
+
+    let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
+        .viewports(&[viewport])
+        .scissors(&[scissors])
+        .build();
+
+    let pipeline_rasterization_info = vk::PipelineRasterizationStateCreateInfo::builder()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::BACK)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .build();
+
+    let pipeline_multisample_info = vk::PipelineMultisampleStateCreateInfo::builder()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1)
+        .build();
+
+    // color blending info per framebuffer
+    let pipeline_color_blend_attachment_info = vk::PipelineColorBlendAttachmentState::builder()
+        .color_write_mask(
+            vk::ColorComponentFlags::R
+                | vk::ColorComponentFlags::G
+                | vk::ColorComponentFlags::B
+                | vk::ColorComponentFlags::A,
+        )
+        .blend_enable(false)
+        .build();
+
+    // color blending settings for the whole pipleine
+    let pipeline_color_blend_info = vk::PipelineColorBlendStateCreateInfo::builder()
+        .attachments(&[pipeline_color_blend_attachment_info])
+        .build();
+
+    // we don't use any shader uniforms so we can leave it empty
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder().build();
+
+    let pipeline_layout = unsafe {
+        device
+            .create_pipeline_layout(&pipeline_layout_info, None)
+            .expect("Couldn't create pipeline layout!")
+    };
+
+    // render pass
+    let render_pass = create_render_pass(&device);
+    dbg![render_pass];
+
+    // shader modules only need to live long enough to create the pipeline
+    unsafe {
+        device.destroy_shader_module(frag_module, None);
+        device.destroy_shader_module(vert_module, None);
+    }
+
     loop {
         let mut exit = false;
 
@@ -214,9 +303,8 @@ pub fn main() {
 
     // destroy objects
     unsafe {
+        device.destroy_pipeline_layout(pipeline_layout, None);
         swapchain_creator.destroy_swapchain(swapchain, None);
-        device.destroy_shader_module(frag_module, None);
-        device.destroy_shader_module(vert_module, None);
         device.destroy_device(None);
         surface_loader.destroy_surface(surface, None);
         debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
@@ -234,7 +322,8 @@ fn create_shader_module<D: DeviceV1_0>(device: &D, code: Vec<u8>) -> vk::ShaderM
         .build();
 
     unsafe {
-        device.create_shader_module(&shader_module_create_info, None)
+        device
+            .create_shader_module(&shader_module_create_info, None)
             .expect("Couldn't create shader module")
     }
 }
@@ -268,7 +357,7 @@ unsafe extern "system" fn vulkan_debug_utils_callback(
         _ => "[Unknown]",
     };
     let message = CStr::from_ptr((*p_callback_data).p_message);
-    println!("[Debug]{}{}{:?}", severity, types, message);
+    eprintln!("[Debug]{}{}{:?}", severity, types, message);
 
     vk::FALSE
 }
@@ -354,6 +443,115 @@ unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     xlib_surface_loader.create_xlib_surface(&x11_create_info, None)
 }
 
+/*
+fn create_render_pass<D: DeviceV1_0>(device: &D) -> vk::RenderPass {
+    // our render pass has a single image, so only one attachment description is
+    // necessary
+    let attachment_desc = vk::AttachmentDescription::builder()
+        .format(SC_FORMAT)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .build();
+
+    dbg![attachment_desc];
+
+    let attachment_ref = vk::AttachmentReference::builder()
+        // the previous attachment will be the 0th attachment in the attachment
+        // array, which we will construct later
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .build();
+
+    let subpass_desc = vk::SubpassDescription::builder()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        // the indices correspond to what you'd write for the output layout in
+        // the fragment shader stage. To output to this image, for example,
+        // you'd write `layout(location = 0) out vec4 f_color`
+        .color_attachments(&[attachment_ref])
+        .build();
+
+    dbg![subpass_desc];
+
+    let render_pass_info = vk::RenderPassCreateInfo::builder()
+        // the previously mentioned attachment array
+        .attachments(&[attachment_desc])
+        .subpasses(&[subpass_desc])
+        .build();
+
+    //--
+    let render_pass_attachments = [attachment_desc];
+
+    let render_pass_info = vk::RenderPassCreateInfo {
+        s_type: vk::StructureType::RENDER_PASS_CREATE_INFO,
+        flags: vk::RenderPassCreateFlags::empty(),
+        p_next: ptr::null(),
+        attachment_count: render_pass_attachments.len() as u32,
+        p_attachments: render_pass_attachments.as_ptr(),
+        subpass_count: 1,
+        p_subpasses: &subpass_desc,
+        dependency_count: 0,
+        p_dependencies: ptr::null(),
+    };
+    //--
+
+    dbg![render_pass_info];
+
+    unsafe { device.create_render_pass(&render_pass_info, None) }
+        .expect("Couldn't create render pass")
+}
+*/
+
+fn create_render_pass(device: &ash::Device) -> vk::RenderPass {
+    let surface_format = vk::Format::B8G8R8A8_UNORM;
+
+    let attachment_desc = vk::AttachmentDescription::builder()
+        .format(SC_FORMAT)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .build();
+
+
+    let attachment_ref = vk::AttachmentReference::builder()
+    // the previous attachment will be the 0th attachment in the attachment
+    // array, which we will construct later
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .build();
+
+    let color_attachment_refs = [attachment_ref];
+    let subpass_desc = vk::SubpassDescription::builder()
+    // the indices correspond to what you'd write for the output layout in
+    // the fragment shader stage. To output to this image, for example,
+    // you'd write `layout(location = 0) out vec4 f_color`
+        .color_attachments(&color_attachment_refs)
+        // .color_attachments(&[attachment_ref])
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .build();
+
+    let render_pass_info = vk::RenderPassCreateInfo::builder()
+    // the previously mentioned attachment array
+        // .attachments(&render_pass_attachments)
+        .attachments(&[attachment_desc])
+        .subpasses(&[subpass_desc])
+        .build();
+
+    unsafe {
+        device
+            .create_render_pass(&render_pass_info, None)
+            .expect("Failed to create render pass!")
+    }
+}
+
 /// Helper function to convert [c_char; SIZE] to string
 fn vk_to_string(raw_string_array: &[c_char]) -> String {
     // Implementation 2
@@ -380,8 +578,8 @@ fn read_shader_code(shader_path: &Path) -> Vec<u8> {
     use std::fs::File;
     use std::io::Read;
 
-    let spv_file = File::open(shader_path)
-        .expect(&format!("Failed to find spv file at {:?}", shader_path));
+    let spv_file =
+        File::open(shader_path).expect(&format!("Failed to find spv file at {:?}", shader_path));
     let bytes_code: Vec<u8> = spv_file.bytes().filter_map(|byte| byte.ok()).collect();
 
     bytes_code
