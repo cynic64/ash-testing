@@ -457,25 +457,24 @@ fn create_render_pass(device: &ash::Device) -> vk::RenderPass {
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
         .build();
 
-
     let attachment_ref = vk::AttachmentReference::builder()
-    // the previous attachment will be the 0th attachment in the attachment
-    // array, which we will construct later
+        // the previous attachment will be the 0th attachment in the attachment
+        // array, which we will construct later
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .build();
 
     let color_attachment_refs = [attachment_ref];
     let subpass_desc = vk::SubpassDescription::builder()
-    // the indices correspond to what you'd write for the output layout in
-    // the fragment shader stage. To output to this image, for example,
-    // you'd write `layout(location = 0) out vec4 f_color`
+        // the indices correspond to what you'd write for the output layout in
+        // the fragment shader stage. To output to this image, for example,
+        // you'd write `layout(location = 0) out vec4 f_color`
         .color_attachments(&color_attachment_refs)
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
         .build();
 
     let render_pass_info = vk::RenderPassCreateInfo::builder()
-    // the previously mentioned attachment array
+        // the previously mentioned attachment array
         // .attachments(&render_pass_attachments)
         .attachments(&[attachment_desc])
         .subpasses(&[subpass_desc])
