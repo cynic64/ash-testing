@@ -277,7 +277,6 @@ pub fn main() {
 
     // render pass
     let render_pass = create_render_pass(&device);
-    dbg![render_pass];
 
     // shader modules only need to live long enough to create the pipeline
     unsafe {
@@ -305,6 +304,7 @@ pub fn main() {
     unsafe {
         device.destroy_pipeline_layout(pipeline_layout, None);
         swapchain_creator.destroy_swapchain(swapchain, None);
+        device.destroy_render_pass(render_pass, None);
         device.destroy_device(None);
         surface_loader.destroy_surface(surface, None);
         debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
@@ -443,72 +443,9 @@ unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     xlib_surface_loader.create_xlib_surface(&x11_create_info, None)
 }
 
-/*
-fn create_render_pass<D: DeviceV1_0>(device: &D) -> vk::RenderPass {
+fn create_render_pass(device: &ash::Device) -> vk::RenderPass {
     // our render pass has a single image, so only one attachment description is
     // necessary
-    let attachment_desc = vk::AttachmentDescription::builder()
-        .format(SC_FORMAT)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .build();
-
-    dbg![attachment_desc];
-
-    let attachment_ref = vk::AttachmentReference::builder()
-        // the previous attachment will be the 0th attachment in the attachment
-        // array, which we will construct later
-        .attachment(0)
-        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .build();
-
-    let subpass_desc = vk::SubpassDescription::builder()
-        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        // the indices correspond to what you'd write for the output layout in
-        // the fragment shader stage. To output to this image, for example,
-        // you'd write `layout(location = 0) out vec4 f_color`
-        .color_attachments(&[attachment_ref])
-        .build();
-
-    dbg![subpass_desc];
-
-    let render_pass_info = vk::RenderPassCreateInfo::builder()
-        // the previously mentioned attachment array
-        .attachments(&[attachment_desc])
-        .subpasses(&[subpass_desc])
-        .build();
-
-    //--
-    let render_pass_attachments = [attachment_desc];
-
-    let render_pass_info = vk::RenderPassCreateInfo {
-        s_type: vk::StructureType::RENDER_PASS_CREATE_INFO,
-        flags: vk::RenderPassCreateFlags::empty(),
-        p_next: ptr::null(),
-        attachment_count: render_pass_attachments.len() as u32,
-        p_attachments: render_pass_attachments.as_ptr(),
-        subpass_count: 1,
-        p_subpasses: &subpass_desc,
-        dependency_count: 0,
-        p_dependencies: ptr::null(),
-    };
-    //--
-
-    dbg![render_pass_info];
-
-    unsafe { device.create_render_pass(&render_pass_info, None) }
-        .expect("Couldn't create render pass")
-}
-*/
-
-fn create_render_pass(device: &ash::Device) -> vk::RenderPass {
-    let surface_format = vk::Format::B8G8R8A8_UNORM;
-
     let attachment_desc = vk::AttachmentDescription::builder()
         .format(SC_FORMAT)
         .samples(vk::SampleCountFlags::TYPE_1)
@@ -534,7 +471,6 @@ fn create_render_pass(device: &ash::Device) -> vk::RenderPass {
     // the fragment shader stage. To output to this image, for example,
     // you'd write `layout(location = 0) out vec4 f_color`
         .color_attachments(&color_attachment_refs)
-        // .color_attachments(&[attachment_ref])
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
         .build();
 
@@ -552,7 +488,7 @@ fn create_render_pass(device: &ash::Device) -> vk::RenderPass {
     }
 }
 
-/// Helper function to convert [c_char; SIZE] to string
+// Helper function to convert [c_char; SIZE] to string
 fn vk_to_string(raw_string_array: &[c_char]) -> String {
     // Implementation 2
     let raw_string = unsafe {
