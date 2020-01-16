@@ -58,8 +58,7 @@ pub fn main() {
         .application_info(&app_info)
         .enabled_layer_names(&layers_names_raw)
         .enabled_extension_names(&extension_names_raw)
-        .push_next(&mut debug_utils_create_info)
-        .build();
+        .push_next(&mut debug_utils_create_info);
 
     let entry = Entry::new().unwrap();
 
@@ -120,15 +119,16 @@ pub fn main() {
     }
 
     // get logical device
-    let device_queue_create_info = vk::DeviceQueueCreateInfo::builder()
+    let device_queue_create_infos = [vk::DeviceQueueCreateInfo::builder()
         .queue_family_index(queue_family_index)
         .queue_priorities(&[1.0])
-        .build();
+        .build()];
+
+    let device_extensions_raw = get_device_extensions_raw();
 
     let device_create_info = vk::DeviceCreateInfo::builder()
-        .queue_create_infos(&[device_queue_create_info])
-        .enabled_extension_names(&get_device_extensions_raw())
-        .build();
+        .queue_create_infos(&device_queue_create_infos)
+        .enabled_extension_names(&device_extensions_raw);
 
     let device = unsafe {
         instance
@@ -161,8 +161,7 @@ pub fn main() {
         .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
         .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
         .image_array_layers(1)
-        .image_extent(starting_dims)
-        .build();
+        .image_extent(starting_dims);
 
     let swapchain_creator = Swapchain::new(&instance, &device);
     let swapchain = unsafe { swapchain_creator.create_swapchain(&sc_create_info, None) }
@@ -184,8 +183,7 @@ pub fn main() {
                     level_count: 1,
                     base_array_layer: 0,
                     layer_count: 1,
-                })
-                .build();
+                });
         })
         .collect();
 
@@ -196,62 +194,59 @@ pub fn main() {
     let frag_module = create_shader_module(&device, frag_code);
     let vert_module = create_shader_module(&device, vert_code);
 
+    let entry_point = CString::new("main").unwrap();
+
     let vert_stage_info = vk::PipelineShaderStageCreateInfo::builder()
         .stage(vk::ShaderStageFlags::VERTEX)
         .module(vert_module)
-        .name(&CString::new("main").unwrap())
-        .build();
+        .name(&entry_point);
 
     let frag_stage_info = vk::PipelineShaderStageCreateInfo::builder()
         .stage(vk::ShaderStageFlags::FRAGMENT)
         .module(frag_module)
-        .name(&CString::new("main").unwrap())
-        .build();
+        .name(&entry_point);
 
-    let shader_stages = [vert_stage_info, frag_stage_info];
+    let shader_stages = [vert_stage_info.build(), frag_stage_info.build()];
 
     // fixed-function pipeline settings
 
     // a.k.a vertex format
-    // we don't reallt have a format since they are hard-coded into the vertex
+    // we don't really have a format since they are hard-coded into the vertex
     // shader for now
-    let pipeline_vertex_input_info = vk::PipelineVertexInputStateCreateInfo::builder().build();
+    let pipeline_vertex_input_info = vk::PipelineVertexInputStateCreateInfo::builder();
 
     let pipeline_input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::builder()
-        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-        .build();
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
 
-    let viewport = vk::Viewport {
+    let viewports = [vk::Viewport {
         x: 0.0,
         y: 0.0,
         width: starting_dims.width as f32,
         height: starting_dims.height as f32,
         min_depth: 0.0,
         max_depth: 1.0,
-    };
+    }];
 
-    let scissors = vk::Rect2D {
+    let scissors = [vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
         extent: starting_dims,
-    };
+    }];
 
     let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
-        .viewports(&[viewport])
-        .scissors(&[scissors])
-        .build();
+        .viewports(&viewports)
+        .scissors(&scissors);
 
     let pipeline_rasterization_info = vk::PipelineRasterizationStateCreateInfo::builder()
         .polygon_mode(vk::PolygonMode::FILL)
         .cull_mode(vk::CullModeFlags::BACK)
-        .front_face(vk::FrontFace::CLOCKWISE)
-        .build();
+        .line_width(1.0)
+        .front_face(vk::FrontFace::CLOCKWISE);
 
     let pipeline_multisample_info = vk::PipelineMultisampleStateCreateInfo::builder()
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1)
-        .build();
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
     // color blending info per framebuffer
-    let pipeline_color_blend_attachment_info = vk::PipelineColorBlendAttachmentState::builder()
+    let pipeline_color_blend_attachment_infos = [vk::PipelineColorBlendAttachmentState::builder()
         .color_write_mask(
             vk::ColorComponentFlags::R
                 | vk::ColorComponentFlags::G
@@ -259,15 +254,14 @@ pub fn main() {
                 | vk::ColorComponentFlags::A,
         )
         .blend_enable(false)
-        .build();
+        .build()];
 
     // color blending settings for the whole pipleine
     let pipeline_color_blend_info = vk::PipelineColorBlendStateCreateInfo::builder()
-        .attachments(&[pipeline_color_blend_attachment_info])
-        .build();
+        .attachments(&pipeline_color_blend_attachment_infos);
 
     // we don't use any shader uniforms so we can leave it empty
-    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder().build();
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder();
 
     let pipeline_layout = unsafe {
         device
@@ -277,6 +271,26 @@ pub fn main() {
 
     // render pass
     let render_pass = create_render_pass(&device);
+
+    // pipeline
+    let pipeline_infos = [vk::GraphicsPipelineCreateInfo::builder()
+        .stages(&shader_stages)
+        .vertex_input_state(&pipeline_vertex_input_info)
+        .input_assembly_state(&pipeline_input_assembly_info)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&pipeline_rasterization_info)
+        .multisample_state(&pipeline_multisample_info)
+        .color_blend_state(&pipeline_color_blend_info)
+        .layout(pipeline_layout)
+        .render_pass(render_pass)
+        .subpass(0)
+        .build()]; // subpass index
+
+    let pipeline = unsafe {
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_infos, None)
+    };
+
+    dbg![pipeline];
 
     // shader modules only need to live long enough to create the pipeline
     unsafe {
@@ -317,9 +331,7 @@ fn create_shader_module<D: DeviceV1_0>(device: &D, code: Vec<u8>) -> vk::ShaderM
     use std::io::Cursor;
 
     let readable_code = read_spv(&mut Cursor::new(&code)).expect("Couldn't read SPV");
-    let shader_module_create_info = vk::ShaderModuleCreateInfo::builder()
-        .code(&readable_code)
-        .build();
+    let shader_module_create_info = vk::ShaderModuleCreateInfo::builder().code(&readable_code);
 
     unsafe {
         device
@@ -446,7 +458,7 @@ unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
 fn create_render_pass(device: &ash::Device) -> vk::RenderPass {
     // our render pass has a single image, so only one attachment description is
     // necessary
-    let attachment_desc = vk::AttachmentDescription::builder()
+    let attachment_descs = [vk::AttachmentDescription::builder()
         .format(SC_FORMAT)
         .samples(vk::SampleCountFlags::TYPE_1)
         .load_op(vk::AttachmentLoadOp::CLEAR)
@@ -455,30 +467,28 @@ fn create_render_pass(device: &ash::Device) -> vk::RenderPass {
         .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .build();
+        .build()];
 
-    let attachment_ref = vk::AttachmentReference::builder()
+    let attachment_refs = [vk::AttachmentReference::builder()
         // the previous attachment will be the 0th attachment in the attachment
         // array, which we will construct later
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .build();
+        .build()];
 
-    let color_attachment_refs = [attachment_ref];
-    let subpass_desc = vk::SubpassDescription::builder()
+    let subpass_descs = [vk::SubpassDescription::builder()
         // the indices correspond to what you'd write for the output layout in
         // the fragment shader stage. To output to this image, for example,
         // you'd write `layout(location = 0) out vec4 f_color`
-        .color_attachments(&color_attachment_refs)
+        .color_attachments(&attachment_refs)
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .build();
+        .build()];
 
     let render_pass_info = vk::RenderPassCreateInfo::builder()
         // the previously mentioned attachment array
         // .attachments(&render_pass_attachments)
-        .attachments(&[attachment_desc])
-        .subpasses(&[subpass_desc])
-        .build();
+        .attachments(&attachment_descs)
+        .subpasses(&subpass_descs);
 
     unsafe {
         device
