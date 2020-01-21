@@ -11,7 +11,7 @@ use std::ptr;
 
 use winit::{Event, WindowEvent};
 
-const SC_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
+const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
 pub fn main() {
     // create winit window
@@ -23,8 +23,13 @@ pub fn main() {
 
     // create instance
     let app_info = vk::ApplicationInfo {
+        s_type: vk::StructureType::APPLICATION_INFO,
+        p_next: ptr::null(),
+        p_application_name: CString::new("Thingy").unwrap().as_ptr(),
+        application_version: 0,
+        p_engine_name: CString::new("Vulkan Engine").unwrap().as_ptr(),
+        engine_version: 0,
         api_version: vk_make_version!(1, 1, 0),
-        ..Default::default()
     };
 
     let layer_names = [
@@ -39,7 +44,7 @@ pub fn main() {
 
     let extension_names_raw = extension_names();
 
-    let mut debug_utils_create_info = vk::DebugUtilsMessengerCreateInfoEXT {
+    let debug_utils_create_info = vk::DebugUtilsMessengerCreateInfoEXT {
         s_type: vk::StructureType::DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
         p_next: ptr::null(),
         flags: vk::DebugUtilsMessengerCreateFlagsEXT::empty(),
@@ -54,11 +59,19 @@ pub fn main() {
         p_user_data: ptr::null_mut(),
     };
 
-    let create_info = vk::InstanceCreateInfo::builder()
-        .application_info(&app_info)
-        .enabled_layer_names(&layers_names_raw)
-        .enabled_extension_names(&extension_names_raw)
-        .push_next(&mut debug_utils_create_info);
+    let create_info = vk::InstanceCreateInfo {
+        s_type: vk::StructureType::INSTANCE_CREATE_INFO,
+        // setting this to a null pointer also works, but leave it like this to
+        // be safe i guess?
+        p_next: &debug_utils_create_info as *const vk::DebugUtilsMessengerCreateInfoEXT
+            as *const c_void,
+        flags: vk::InstanceCreateFlags::empty(),
+        p_application_info: &app_info,
+        enabled_layer_count: layer_names.len() as u32,
+        pp_enabled_layer_names: layers_names_raw.as_ptr(),
+        enabled_extension_count: extension_names_raw.len() as u32,
+        pp_enabled_extension_names: extension_names_raw.as_ptr(),
+    };
 
     let entry = Entry::new().unwrap();
 
@@ -119,16 +132,31 @@ pub fn main() {
     }
 
     // get logical device
-    let device_queue_create_infos = [vk::DeviceQueueCreateInfo::builder()
-        .queue_family_index(queue_family_index)
-        .queue_priorities(&[1.0])
-        .build()];
+    let device_queue_create_info = vk::DeviceQueueCreateInfo {
+        s_type: vk::StructureType::DEVICE_QUEUE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::DeviceQueueCreateFlags::empty(),
+        queue_family_index,
+        queue_count: 1,
+        p_queue_priorities: [1.0].as_ptr(),
+    };
 
     let device_extensions_raw = get_device_extensions_raw();
 
-    let device_create_info = vk::DeviceCreateInfo::builder()
-        .queue_create_infos(&device_queue_create_infos)
-        .enabled_extension_names(&device_extensions_raw);
+    let device_create_info = vk::DeviceCreateInfo {
+        s_type: vk::StructureType::DEVICE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::DeviceCreateFlags::empty(),
+        queue_create_info_count: 1,
+        p_queue_create_infos: [device_queue_create_info].as_ptr(),
+        // not used by Vulkan anymore
+        enabled_layer_count: 0,
+        pp_enabled_layer_names: ptr::null(),
+        // these are
+        enabled_extension_count: device_extensions_raw.len() as u32,
+        pp_enabled_extension_names: device_extensions_raw.as_ptr(),
+        p_enabled_features: &vk::PhysicalDeviceFeatures::builder().build(),
+    };
 
     let device = unsafe {
         instance
@@ -146,25 +174,35 @@ pub fn main() {
 
     // create swapchain
     let sc_format = vk::SurfaceFormatKHR {
-        format: SC_FORMAT,
+        format: SWAPCHAIN_FORMAT,
         color_space: vk::ColorSpaceKHR::default(),
     };
 
     let sc_present_mode = vk::PresentModeKHR::IMMEDIATE;
 
-    let sc_create_info = vk::SwapchainCreateInfoKHR::builder()
-        .min_image_count(3)
-        .image_format(vk::Format::B8G8R8A8_UNORM)
-        .present_mode(vk::PresentModeKHR::IMMEDIATE)
-        .surface(surface)
-        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-        .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
-        .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-        .image_array_layers(1)
-        .image_extent(starting_dims);
+    let swapchain_create_info = vk::SwapchainCreateInfoKHR {
+        s_type: vk::StructureType::SWAPCHAIN_CREATE_INFO_KHR,
+        p_next: ptr::null(),
+        flags: vk::SwapchainCreateFlagsKHR::empty(),
+        surface: surface,
+        min_image_count: 3,
+        image_format: SWAPCHAIN_FORMAT,
+        image_color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+        image_extent: starting_dims,
+        image_array_layers: 1,
+        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        image_sharing_mode: vk::SharingMode::EXCLUSIVE,
+        queue_family_index_count: 0,
+        p_queue_family_indices: ptr::null(),
+        pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
+        composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
+        present_mode: vk::PresentModeKHR::IMMEDIATE,
+        clipped: vk::TRUE,
+        old_swapchain: vk::SwapchainKHR::null(),
+    };
 
     let swapchain_creator = Swapchain::new(&instance, &device);
-    let swapchain = unsafe { swapchain_creator.create_swapchain(&sc_create_info, None) }
+    let swapchain = unsafe { swapchain_creator.create_swapchain(&swapchain_create_info, None) }
         .expect("Couldn't create swapchain");
 
     let images = unsafe { swapchain_creator.get_swapchain_images(swapchain) }
@@ -173,17 +211,27 @@ pub fn main() {
     let image_views: Vec<_> = images
         .iter()
         .map(|image| {
-            let iv_info = vk::ImageViewCreateInfo::builder()
-                .image(*image)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(SC_FORMAT)
-                .subresource_range(vk::ImageSubresourceRange {
+            let iv_info = vk::ImageViewCreateInfo {
+                s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+                p_next: ptr::null(),
+                flags: vk::ImageViewCreateFlags::empty(),
+                image: *image,
+                view_type: vk::ImageViewType::TYPE_2D,
+                format: SWAPCHAIN_FORMAT,
+                components: vk::ComponentMapping {
+                    r: vk::ComponentSwizzle::IDENTITY,
+                    g: vk::ComponentSwizzle::IDENTITY,
+                    b: vk::ComponentSwizzle::IDENTITY,
+                    a: vk::ComponentSwizzle::IDENTITY,
+                },
+                subresource_range: vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
                     level_count: 1,
                     base_array_layer: 0,
                     layer_count: 1,
-                });
+                },
+            };
         })
         .collect();
 
@@ -459,7 +507,7 @@ fn create_render_pass(device: &ash::Device) -> vk::RenderPass {
     // our render pass has a single image, so only one attachment description is
     // necessary
     let attachment_descs = [vk::AttachmentDescription::builder()
-        .format(SC_FORMAT)
+        .format(SWAPCHAIN_FORMAT)
         .samples(vk::SampleCountFlags::TYPE_1)
         .load_op(vk::AttachmentLoadOp::CLEAR)
         .store_op(vk::AttachmentStoreOp::STORE)
