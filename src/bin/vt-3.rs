@@ -244,27 +244,42 @@ pub fn main() {
 
     let entry_point = CString::new("main").unwrap();
 
-    let vert_stage_info = vk::PipelineShaderStageCreateInfo::builder()
-        .stage(vk::ShaderStageFlags::VERTEX)
-        .module(vert_module)
-        .name(&entry_point);
+    let vert_stage_info = vk::PipelineShaderStageCreateInfo {
+        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineShaderStageCreateFlags::empty(),
+        stage: vk::ShaderStageFlags::VERTEX,
+        module: vert_module,
+        p_name: entry_point.as_ptr(),
+        p_specialization_info: &vk::SpecializationInfo::default(),
+    };
 
-    let frag_stage_info = vk::PipelineShaderStageCreateInfo::builder()
-        .stage(vk::ShaderStageFlags::FRAGMENT)
-        .module(frag_module)
-        .name(&entry_point);
+    let frag_stage_info = vk::PipelineShaderStageCreateInfo {
+        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineShaderStageCreateFlags::empty(),
+        stage: vk::ShaderStageFlags::FRAGMENT,
+        module: frag_module,
+        p_name: entry_point.as_ptr(),
+        p_specialization_info: &vk::SpecializationInfo::default(),
+    };
 
-    let shader_stages = [vert_stage_info.build(), frag_stage_info.build()];
+    let shader_stages = [vert_stage_info, frag_stage_info];
 
     // fixed-function pipeline settings
 
     // a.k.a vertex format
     // we don't really have a format since they are hard-coded into the vertex
     // shader for now
-    let pipeline_vertex_input_info = vk::PipelineVertexInputStateCreateInfo::builder();
+    let pipeline_vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
 
-    let pipeline_input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo::builder()
-        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let pipeline_input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineInputAssemblyStateCreateFlags::empty(),
+        topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+        primitive_restart_enable: vk::FALSE,
+    };
 
     let viewports = [vk::Viewport {
         x: 0.0,
@@ -280,36 +295,84 @@ pub fn main() {
         extent: starting_dims,
     }];
 
-    let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
-        .viewports(&viewports)
-        .scissors(&scissors);
+    let viewport_state = vk::PipelineViewportStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineViewportStateCreateFlags::empty(),
+        viewport_count: viewports.len() as u32,
+        p_viewports: viewports.as_ptr(),
+        scissor_count: scissors.len() as u32,
+        p_scissors: scissors.as_ptr(),
+    };
 
-    let pipeline_rasterization_info = vk::PipelineRasterizationStateCreateInfo::builder()
-        .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::BACK)
-        .line_width(1.0)
-        .front_face(vk::FrontFace::CLOCKWISE);
+    let pipeline_rasterization_info = vk::PipelineRasterizationStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineRasterizationStateCreateFlags::empty(),
+        depth_clamp_enable: vk::FALSE,
+        rasterizer_discard_enable: vk::FALSE,
+        polygon_mode: vk::PolygonMode::FILL,
+        cull_mode: vk::CullModeFlags::BACK,
+        front_face: vk::FrontFace::CLOCKWISE,
+        depth_bias_enable: vk::FALSE,
+        depth_bias_constant_factor: 0.0,
+        depth_bias_clamp: 0.0,
+        depth_bias_slope_factor: 0.0,
+        line_width: 1.0,
+    };
 
-    let pipeline_multisample_info = vk::PipelineMultisampleStateCreateInfo::builder()
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let pipeline_multisample_info = vk::PipelineMultisampleStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineMultisampleStateCreateFlags::empty(),
+        rasterization_samples: vk::SampleCountFlags::TYPE_1,
+        sample_shading_enable: vk::FALSE,
+        min_sample_shading: 1.0,
+        p_sample_mask: ptr::null(),
+        alpha_to_coverage_enable: vk::FALSE,
+        alpha_to_one_enable: vk::FALSE,
+    };
 
     // color blending info per framebuffer
-    let pipeline_color_blend_attachment_infos = [vk::PipelineColorBlendAttachmentState::builder()
-        .color_write_mask(
-            vk::ColorComponentFlags::R
-                | vk::ColorComponentFlags::G
-                | vk::ColorComponentFlags::B
-                | vk::ColorComponentFlags::A,
-        )
-        .blend_enable(false)
-        .build()];
+    let pipeline_color_blend_attachment_infos = [vk::PipelineColorBlendAttachmentState {
+        blend_enable: vk::FALSE,
+        // not used because we disabled blending
+        src_color_blend_factor: vk::BlendFactor::ONE,
+        dst_color_blend_factor: vk::BlendFactor::ZERO,
+        color_blend_op: vk::BlendOp::ADD,
+        src_alpha_blend_factor: vk::BlendFactor::ONE,
+        dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+        alpha_blend_op: vk::BlendOp::ADD,
+
+        // is used
+        color_write_mask: vk::ColorComponentFlags::R
+            & vk::ColorComponentFlags::G
+            & vk::ColorComponentFlags::G
+            & vk::ColorComponentFlags::B,
+    }];
 
     // color blending settings for the whole pipleine
-    let pipeline_color_blend_info = vk::PipelineColorBlendStateCreateInfo::builder()
-        .attachments(&pipeline_color_blend_attachment_infos);
+    let pipeline_color_blend_info = vk::PipelineColorBlendStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineColorBlendStateCreateFlags::empty(),
+        logic_op_enable: vk::FALSE,
+        logic_op: vk::LogicOp::COPY,             // optional
+        attachment_count: pipeline_color_blend_attachment_infos.len() as u32,
+        p_attachments: pipeline_color_blend_attachment_infos.as_ptr(),
+        blend_constants: [0.0, 0.0, 0.0, 0.0],   // optional
+    };
 
-    // we don't use any shader uniforms so we can leave it empty
-    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder();
+    // we don't use any shader uniforms so we leave it empty
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo {
+        s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineLayoutCreateFlags::empty(),
+        set_layout_count: 0,
+        p_set_layouts: ptr::null(),
+        push_constant_range_count: 0,
+        p_push_constant_ranges: ptr::null(),
+    };
 
     let pipeline_layout = unsafe {
         device
@@ -321,18 +384,27 @@ pub fn main() {
     let render_pass = create_render_pass(&device);
 
     // pipeline
-    let pipeline_infos = [vk::GraphicsPipelineCreateInfo::builder()
-        .stages(&shader_stages)
-        .vertex_input_state(&pipeline_vertex_input_info)
-        .input_assembly_state(&pipeline_input_assembly_info)
-        .viewport_state(&viewport_state)
-        .rasterization_state(&pipeline_rasterization_info)
-        .multisample_state(&pipeline_multisample_info)
-        .color_blend_state(&pipeline_color_blend_info)
-        .layout(pipeline_layout)
-        .render_pass(render_pass)
-        .subpass(0)
-        .build()]; // subpass index
+    let pipeline_infos = [vk::GraphicsPipelineCreateInfo {
+        s_type: vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineCreateFlags::empty(),
+        stage_count: shader_stages.len() as u32,
+        p_stages: shader_stages.as_ptr(),
+        p_vertex_input_state: &pipeline_vertex_input_info,
+        p_input_assembly_state: &pipeline_input_assembly_info,
+        p_tessellation_state: ptr::null(),
+        p_viewport_state: &viewport_state,
+        p_rasterization_state: &pipeline_rasterization_info,
+        p_multisample_state: &pipeline_multisample_info,
+        p_depth_stencil_state: ptr::null(),
+        p_color_blend_state: &pipeline_color_blend_info,
+        p_dynamic_state: ptr::null(),
+        layout: pipeline_layout,
+        render_pass,
+        subpass: 0,
+        base_pipeline_handle: vk::Pipeline::null(),
+        base_pipeline_index: 0,
+    }];
 
     let pipeline = unsafe {
         device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_infos, None)
