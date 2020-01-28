@@ -357,10 +357,10 @@ pub fn main() {
         p_next: ptr::null(),
         flags: vk::PipelineColorBlendStateCreateFlags::empty(),
         logic_op_enable: vk::FALSE,
-        logic_op: vk::LogicOp::COPY,             // optional
+        logic_op: vk::LogicOp::COPY, // optional
         attachment_count: pipeline_color_blend_attachment_infos.len() as u32,
         p_attachments: pipeline_color_blend_attachment_infos.as_ptr(),
-        blend_constants: [0.0, 0.0, 0.0, 0.0],   // optional
+        blend_constants: [0.0, 0.0, 0.0, 0.0], // optional
     };
 
     // we don't use any shader uniforms so we leave it empty
@@ -408,7 +408,8 @@ pub fn main() {
 
     let pipeline = unsafe {
         device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_infos, None)
-    };
+    }
+    .expect("Couldn't create graphics pipeline")[0];
 
     dbg![pipeline];
 
@@ -436,6 +437,7 @@ pub fn main() {
 
     // destroy objects
     unsafe {
+        device.destroy_pipeline(pipeline, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
         swapchain_creator.destroy_swapchain(swapchain, None);
         device.destroy_render_pass(render_pass, None);
