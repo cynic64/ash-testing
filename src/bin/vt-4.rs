@@ -232,6 +232,9 @@ pub fn main() {
                     layer_count: 1,
                 },
             };
+
+            unsafe { device.create_image_view(&iv_info, None) }
+                .expect("Couldn't create image view info")
         })
         .collect();
 
@@ -411,13 +414,14 @@ pub fn main() {
     }
     .expect("Couldn't create graphics pipeline")[0];
 
-    dbg![pipeline];
-
     // shader modules only need to live long enough to create the pipeline
     unsafe {
         device.destroy_shader_module(frag_module, None);
         device.destroy_shader_module(vert_module, None);
     }
+
+    // framebuffer creation
+    // let framebuffers = create_framebuffers();
 
     loop {
         let mut exit = false;
@@ -437,6 +441,9 @@ pub fn main() {
 
     // destroy objects
     unsafe {
+        image_views
+            .iter()
+            .for_each(|iv| device.destroy_image_view(*iv, None));
         device.destroy_pipeline(pipeline, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
         swapchain_creator.destroy_swapchain(swapchain, None);
@@ -447,6 +454,8 @@ pub fn main() {
         instance.destroy_instance(None);
     }
 }
+
+// fn create_framebuffers(image_views:
 
 fn create_shader_module<D: DeviceV1_0>(device: &D, code: Vec<u8>) -> vk::ShaderModule {
     use ash::util::read_spv;
