@@ -421,7 +421,7 @@ pub fn main() {
     }
 
     // framebuffer creation
-    // let framebuffers = create_framebuffers();
+    let framebuffers = create_framebuffers(&device, render_pass, starting_dims, &image_views);
 
     loop {
         let mut exit = false;
@@ -444,6 +444,9 @@ pub fn main() {
         image_views
             .iter()
             .for_each(|iv| device.destroy_image_view(*iv, None));
+        framebuffers
+            .iter()
+            .for_each(|fb| device.destroy_framebuffer(*fb, None));
         device.destroy_pipeline(pipeline, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
         swapchain_creator.destroy_swapchain(swapchain, None);
@@ -455,7 +458,32 @@ pub fn main() {
     }
 }
 
-// fn create_framebuffers(image_views:
+fn create_framebuffers<D: DeviceV1_0>(
+    device: &D,
+    render_pass: vk::RenderPass,
+    dimensions: vk::Extent2D,
+    image_views: &[vk::ImageView],
+) -> Vec<vk::Framebuffer> {
+    image_views
+        .iter()
+        .map(|iv| {
+            let framebuffer_info = vk::FramebufferCreateInfo {
+                s_type: vk::StructureType::FRAMEBUFFER_CREATE_INFO,
+                p_next: ptr::null(),
+                flags: vk::FramebufferCreateFlags::empty(),
+                render_pass,
+                attachment_count: 1,
+                p_attachments: [*iv].as_ptr(),
+                width: dimensions.width,
+                height: dimensions.height,
+                layers: 1,
+            };
+
+            unsafe { device.create_framebuffer(&framebuffer_info, None) }
+                .expect("Couldn't create framebuffer")
+        })
+        .collect()
+}
 
 fn create_shader_module<D: DeviceV1_0>(device: &D, code: Vec<u8>) -> vk::ShaderModule {
     use ash::util::read_spv;
