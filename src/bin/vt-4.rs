@@ -173,13 +173,6 @@ pub fn main() {
     let starting_dims = check_device_swapchain_caps(&surface_loader, physical_device, surface);
 
     // create swapchain
-    let sc_format = vk::SurfaceFormatKHR {
-        format: SWAPCHAIN_FORMAT,
-        color_space: vk::ColorSpaceKHR::default(),
-    };
-
-    let sc_present_mode = vk::PresentModeKHR::IMMEDIATE;
-
     let swapchain_create_info = vk::SwapchainCreateInfoKHR {
         s_type: vk::StructureType::SWAPCHAIN_CREATE_INFO_KHR,
         p_next: ptr::null(),
@@ -315,7 +308,7 @@ pub fn main() {
         depth_clamp_enable: vk::FALSE,
         rasterizer_discard_enable: vk::FALSE,
         polygon_mode: vk::PolygonMode::FILL,
-        cull_mode: vk::CullModeFlags::BACK,
+        cull_mode: vk::CullModeFlags::NONE,
         front_face: vk::FrontFace::CLOCKWISE,
         depth_bias_enable: vk::FALSE,
         depth_bias_constant_factor: 0.0,
@@ -349,9 +342,9 @@ pub fn main() {
 
         // is used
         color_write_mask: vk::ColorComponentFlags::R
-            & vk::ColorComponentFlags::G
-            & vk::ColorComponentFlags::G
-            & vk::ColorComponentFlags::B,
+            | vk::ColorComponentFlags::G
+            | vk::ColorComponentFlags::G
+            | vk::ColorComponentFlags::B,
     }];
 
     // color blending settings for the whole pipleine
@@ -422,8 +415,27 @@ pub fn main() {
 
     // framebuffer creation
     let framebuffers = create_framebuffers(&device, render_pass, starting_dims, &image_views);
+    dbg![&framebuffers];
+
+    // command pool
+    let command_pool = create_command_pool(&device, queue_family_index);
+
+    // command buffers (re-used between frames)
+    let command_buffers = create_command_buffers(
+        &device,
+        render_pass,
+        command_pool,
+        starting_dims,
+        &framebuffers,
+        pipeline,
+    );
+
+    // semaphores
+    let (image_available_semaphore, render_finished_semaphore) = create_semaphores(&device);
 
     loop {
+        println!("start!");
+
         let mut exit = false;
 
         events_loop.poll_events(|ev| match ev {
@@ -437,6 +449,66 @@ pub fn main() {
         if exit {
             break;
         }
+
+        // for.
+        let (image_idx, _is_sub_optimal) = unsafe {
+            swapchain_creator.acquire_next_image(
+                swapchain,
+                std::u64::MAX,
+                image_available_semaphore,
+                vk::Fence::null(),
+            )
+        }
+        .expect("Couldn't acquire next image");
+
+        // submit command buffer
+        let wait_semaphores = [image_available_semaphore];
+
+        // "Each entry in the waitStages array corresponds to the semaphore with
+        // the same index in pWaitSemaphores."
+        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+
+        let cur_command_buffers = [command_buffers[image_idx as usize]];
+
+        let signal_semaphores = [render_finished_semaphore];
+
+        let submit_info = vk::SubmitInfo {
+            s_type: vk::StructureType::SUBMIT_INFO,
+            p_next: ptr::null(),
+            wait_semaphore_count: 1,
+            p_wait_semaphores: wait_semaphores.as_ptr(),
+            p_wait_dst_stage_mask: wait_stages.as_ptr(),
+            command_buffer_count: 1,
+            p_command_buffers: cur_command_buffers.as_ptr(),
+            signal_semaphore_count: 1,
+            p_signal_semaphores: signal_semaphores.as_ptr(),
+        };
+
+        let submissions = [submit_info];
+        unsafe { device.queue_submit(queue, &submissions, vk::Fence::null()) }
+            .expect("Couldn't submit command buffer");
+
+        // present result to swapchain
+        let swapchains = [swapchain];
+        let image_indices = [image_idx];
+
+        let present_info = vk::PresentInfoKHR {
+            s_type: vk::StructureType::PRESENT_INFO_KHR,
+            p_next: ptr::null(),
+            wait_semaphore_count: 1,
+            p_wait_semaphores: signal_semaphores.as_ptr(),
+            swapchain_count: 1,
+            p_swapchains: swapchains.as_ptr(),
+            p_image_indices: image_indices.as_ptr(),
+            p_results: ptr::null_mut(),
+        };
+
+        unsafe { swapchain_creator.queue_present(queue, &present_info) }
+            .expect("Couldn't present swapchain result");
+
+        println!("end!");
+
+        unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
     }
 
     // destroy objects
@@ -447,6 +519,9 @@ pub fn main() {
         framebuffers
             .iter()
             .for_each(|fb| device.destroy_framebuffer(*fb, None));
+        device.destroy_semaphore(image_available_semaphore, None);
+        device.destroy_semaphore(render_finished_semaphore, None);
+        device.destroy_command_pool(command_pool, None);
         device.destroy_pipeline(pipeline, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
         swapchain_creator.destroy_swapchain(swapchain, None);
@@ -458,6 +533,112 @@ pub fn main() {
     }
 }
 
+fn create_semaphores<D: DeviceV1_0>(device: &D) -> (vk::Semaphore, vk::Semaphore) {
+    let semaphore_info = vk::SemaphoreCreateInfo {
+        s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::SemaphoreCreateFlags::empty(),
+    };
+
+    let s1 = unsafe { device.create_semaphore(&semaphore_info, None) }
+        .expect("Couldn't create semaphore");
+    let s2 = unsafe { device.create_semaphore(&semaphore_info, None) }
+        .expect("Couldn't create semaphore");
+
+    (s1, s2)
+}
+
+fn create_command_pool<D: DeviceV1_0>(device: &D, queue_family_index: u32) -> vk::CommandPool {
+    let command_pool_info = vk::CommandPoolCreateInfo {
+        s_type: vk::StructureType::COMMAND_POOL_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::CommandPoolCreateFlags::empty(),
+        queue_family_index,
+    };
+
+    unsafe { device.create_command_pool(&command_pool_info, None) }
+        .expect("Couldn't create command pool")
+}
+
+fn create_command_buffers<D: DeviceV1_0>(
+    device: &D,
+    render_pass: vk::RenderPass,
+    command_pool: vk::CommandPool,
+    dimensions: vk::Extent2D,
+    framebuffers: &[vk::Framebuffer],
+    pipeline: vk::Pipeline,
+) -> Vec<vk::CommandBuffer> {
+    let command_buffer_alloc_info = vk::CommandBufferAllocateInfo {
+        s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
+        p_next: ptr::null(),
+        command_pool,
+        // Primary: can be submitted to a queue, but not called from other command buffers
+        // Secondary: can't be directly submitted, but can be called from other command buffers
+        level: vk::CommandBufferLevel::PRIMARY,
+        command_buffer_count: framebuffers.len() as u32,
+    };
+
+    let command_buffers = unsafe { device.allocate_command_buffers(&command_buffer_alloc_info) }
+        .expect("Couldn't allocate command buffers");
+
+    command_buffers
+        .iter()
+        .enumerate()
+        .map(|(idx, &command_buffer)| {
+            // begin command buffer
+            let command_buffer_begin_info = vk::CommandBufferBeginInfo {
+                s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
+                p_next: ptr::null(),
+                flags: vk::CommandBufferUsageFlags::empty(),
+                p_inheritance_info: ptr::null(),
+            };
+
+            unsafe { device.begin_command_buffer(command_buffer, &command_buffer_begin_info) }
+                .expect("Couldn't begin command buffer");
+
+            // Start render pass
+            let clear_values = [vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.5, 0.5, 0.5, 1.0],
+                },
+            }];
+
+            let render_pass_begin_info = vk::RenderPassBeginInfo {
+                s_type: vk::StructureType::RENDER_PASS_BEGIN_INFO,
+                p_next: ptr::null(),
+                render_pass,
+                framebuffer: framebuffers[idx],
+                render_area: vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: dimensions,
+                },
+                clear_value_count: 1,
+                p_clear_values: clear_values.as_ptr(),
+            };
+
+            unsafe {
+                device.cmd_begin_render_pass(
+                    command_buffer,
+                    &render_pass_begin_info,
+                    vk::SubpassContents::INLINE,
+                );
+
+                device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+
+                // 3 vertices, 1 instance, first vertex 0, first instance 0
+                device.cmd_draw(command_buffer, 3, 1, 0, 0);
+
+                device.cmd_end_render_pass(command_buffer);
+            }
+
+            unsafe { device.end_command_buffer(command_buffer) }
+                .expect("Couldn't record command buffer!");
+
+            command_buffer
+        })
+        .collect()
+}
+
 fn create_framebuffers<D: DeviceV1_0>(
     device: &D,
     render_pass: vk::RenderPass,
@@ -467,13 +648,14 @@ fn create_framebuffers<D: DeviceV1_0>(
     image_views
         .iter()
         .map(|iv| {
+            let image_views = [*iv];
             let framebuffer_info = vk::FramebufferCreateInfo {
                 s_type: vk::StructureType::FRAMEBUFFER_CREATE_INFO,
                 p_next: ptr::null(),
                 flags: vk::FramebufferCreateFlags::empty(),
                 render_pass,
                 attachment_count: 1,
-                p_attachments: [*iv].as_ptr(),
+                p_attachments: image_views.as_ptr(),
                 width: dimensions.width,
                 height: dimensions.height,
                 layers: 1,
@@ -617,37 +799,69 @@ unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
 fn create_render_pass(device: &ash::Device) -> vk::RenderPass {
     // our render pass has a single image, so only one attachment description is
     // necessary
-    let attachment_descs = [vk::AttachmentDescription::builder()
-        .format(SWAPCHAIN_FORMAT)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .build()];
+    let attachment_descs = [vk::AttachmentDescription {
+        flags: vk::AttachmentDescriptionFlags::empty(),
+        format: SWAPCHAIN_FORMAT,
+        samples: vk::SampleCountFlags::TYPE_1,
+        load_op: vk::AttachmentLoadOp::CLEAR,
+        store_op: vk::AttachmentStoreOp::STORE,
+        stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+        stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+        initial_layout: vk::ImageLayout::UNDEFINED,
+        final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+    }];
 
-    let attachment_refs = [vk::AttachmentReference::builder()
-        // the previous attachment will be the 0th attachment in the attachment
-        // array, which we will construct later
-        .attachment(0)
-        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .build()];
+    let color_attachments = [vk::AttachmentReference {
+        attachment: 0,
+        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+    }];
 
-    let subpass_descs = [vk::SubpassDescription::builder()
-        // the indices correspond to what you'd write for the output layout in
-        // the fragment shader stage. To output to this image, for example,
-        // you'd write `layout(location = 0) out vec4 f_color`
-        .color_attachments(&attachment_refs)
-        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .build()];
+    let subpass_descs = [vk::SubpassDescription {
+        flags: vk::SubpassDescriptionFlags::empty(),
+        pipeline_bind_point: vk::PipelineBindPoint::GRAPHICS,
+        input_attachment_count: 0,
+        p_input_attachments: ptr::null(),
+        color_attachment_count: 1,
+        p_color_attachments: color_attachments.as_ptr(),
+        p_resolve_attachments: ptr::null(),
+        p_depth_stencil_attachment: ptr::null(),
+        preserve_attachment_count: 0,
+        p_preserve_attachments: ptr::null(),
+    }];
 
-    let render_pass_info = vk::RenderPassCreateInfo::builder()
-        // the previously mentioned attachment array
-        // .attachments(&render_pass_attachments)
-        .attachments(&attachment_descs)
-        .subpasses(&subpass_descs);
+    // apparently needed to ensure we don't start drawing before we acquire a
+    // swapchain image, but I don't know why it's necessary because we already
+    // use a semaphore to synchronize between acquiring the image and executing
+    // the command buffer.
+    let subpass_dependencies = [vk::SubpassDependency {
+        // "The special value VK_SUBPASS_EXTERNAL refers to the implicit subpass
+        // before or after the render pass depending on whether it is specified
+        // in srcSubpass or dstSubpass"
+        src_subpass: vk::SUBPASS_EXTERNAL,
+
+        // refers to the subpass we draw in, which is at index 0
+        dst_subpass: 0,
+
+        // i don't understand this
+        src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        src_access_mask: vk::AccessFlags::empty(),
+        dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_READ
+            | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        dependency_flags: vk::DependencyFlags::empty(),
+    }];
+
+    let render_pass_info = vk::RenderPassCreateInfo {
+        s_type: vk::StructureType::RENDER_PASS_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::RenderPassCreateFlags::empty(),
+        attachment_count: 1,
+        p_attachments: attachment_descs.as_ptr(),
+        subpass_count: 1,
+        p_subpasses: subpass_descs.as_ptr(),
+        dependency_count: 1,
+        p_dependencies: subpass_dependencies.as_ptr(),
+    };
 
     unsafe {
         device
