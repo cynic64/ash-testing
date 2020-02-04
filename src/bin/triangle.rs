@@ -16,16 +16,14 @@ struct Vertex {
 fn main() {
     unsafe {
         let base = ExampleBase::new(1920, 1080);
-        let renderpass_attachments = [
-            vk::AttachmentDescription {
-                format: base.surface_format.format,
-                samples: vk::SampleCountFlags::TYPE_1,
-                load_op: vk::AttachmentLoadOp::CLEAR,
-                store_op: vk::AttachmentStoreOp::STORE,
-                final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
-                ..Default::default()
-            },
-        ];
+        let renderpass_attachments = [vk::AttachmentDescription {
+            format: base.surface_format.format,
+            samples: vk::SampleCountFlags::TYPE_1,
+            load_op: vk::AttachmentLoadOp::CLEAR,
+            store_op: vk::AttachmentStoreOp::STORE,
+            final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+            ..Default::default()
+        }];
         let color_attachment_refs = [vk::AttachmentReference {
             attachment: 0,
             layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -187,7 +185,8 @@ fn main() {
             .unwrap();
         let mut vertex_spv_file =
             Cursor::new(&include_bytes!("../../shaders/triangle/triangle.vert.spv")[..]);
-        let mut frag_spv_file = Cursor::new(&include_bytes!("../../shaders/triangle/triangle.frag.spv")[..]);
+        let mut frag_spv_file =
+            Cursor::new(&include_bytes!("../../shaders/triangle/triangle.frag.spv")[..]);
 
         let vertex_code =
             read_spv(&mut vertex_spv_file).expect("Failed to read vertex shader spv file");
@@ -338,13 +337,11 @@ fn main() {
                     vk::Fence::null(),
                 )
                 .unwrap();
-            let clear_values = [
-                vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 0.0],
-                    },
+            let clear_values = [vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 0.0],
                 },
-            ];
+            }];
 
             let render_pass_begin_info = vk::RenderPassBeginInfo::builder()
                 .render_pass(renderpass)
@@ -409,11 +406,12 @@ fn main() {
                 .swapchains(&swapchains)
                 .image_indices(&image_indices);
 
-            let present_result = base.swapchain_loader
+            let present_result = base
+                .swapchain_loader
                 .queue_present(base.present_queue, &present_info);
 
             match present_result {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => panic!("Swapchain out of date!"),
                 Err(e) => println!("{:?}", e),
             }

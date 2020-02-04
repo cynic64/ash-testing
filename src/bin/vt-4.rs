@@ -12,6 +12,7 @@ use std::ptr;
 use winit::{Event, WindowEvent};
 
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
+const FRAMES_IN_FLIGHT: usize = 2;
 
 pub fn main() {
     // create winit window
@@ -430,8 +431,17 @@ pub fn main() {
         pipeline,
     );
 
-    // semaphores
-    let (image_available_semaphore, render_finished_semaphore) = create_semaphores(&device);
+    // sync objects
+    let (
+        image_available_semaphores,
+        render_finished_semaphores,
+        in_flight_fences,
+        images_in_flight,
+    ) = create_sync_objects(&device);
+
+    // will also be used to keep track of which set of synchronization
+    // primitives to use
+    let mut frames_drawn = 0;
 
     loop {
         println!("start!");
@@ -450,19 +460,31 @@ pub fn main() {
             break;
         }
 
-        // for.
+        let cur_image_available_semaphore =
+            image_available_semaphores[frames_drawn % FRAMES_IN_FLIGHT];
+        let cur_render_finished_semaphore =
+            render_finished_semaphores[frames_drawn % FRAMES_IN_FLIGHT];
+        let cur_fence = in_flight_fences[frames_drawn % FRAMES_IN_FLIGHT];
+
+        // wait for the fence associated with this swapchain image
+        unsafe { device.wait_for_fences(&[cur_fence], true, std::u64::MAX) }
+            .expect("Couldn't wait for in_flight fence");
+
+        // reset fence
+        unsafe { device.reset_fences(&[cur_fence]) }.expect("Couldn't reset in_flight fence");
+
         let (image_idx, _is_sub_optimal) = unsafe {
             swapchain_creator.acquire_next_image(
                 swapchain,
                 std::u64::MAX,
-                image_available_semaphore,
+                cur_image_available_semaphore,
                 vk::Fence::null(),
             )
         }
         .expect("Couldn't acquire next image");
 
         // submit command buffer
-        let wait_semaphores = [image_available_semaphore];
+        let wait_semaphores = [cur_image_available_semaphore];
 
         // "Each entry in the waitStages array corresponds to the semaphore with
         // the same index in pWaitSemaphores."
@@ -470,7 +492,7 @@ pub fn main() {
 
         let cur_command_buffers = [command_buffers[image_idx as usize]];
 
-        let signal_semaphores = [render_finished_semaphore];
+        let signal_semaphores = [cur_render_finished_semaphore];
 
         let submit_info = vk::SubmitInfo {
             s_type: vk::StructureType::SUBMIT_INFO,
@@ -485,7 +507,7 @@ pub fn main() {
         };
 
         let submissions = [submit_info];
-        unsafe { device.queue_submit(queue, &submissions, vk::Fence::null()) }
+        unsafe { device.queue_submit(queue, &submissions, cur_fence) }
             .expect("Couldn't submit command buffer");
 
         // present result to swapchain
@@ -506,10 +528,12 @@ pub fn main() {
         unsafe { swapchain_creator.queue_present(queue, &present_info) }
             .expect("Couldn't present swapchain result");
 
-        println!("end!");
+        frames_drawn += 1;
 
-        unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
+        println!("end!");
     }
+
+    unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
 
     // destroy objects
     unsafe {
@@ -519,8 +543,10 @@ pub fn main() {
         framebuffers
             .iter()
             .for_each(|fb| device.destroy_framebuffer(*fb, None));
+        /*
         device.destroy_semaphore(image_available_semaphore, None);
         device.destroy_semaphore(render_finished_semaphore, None);
+        */
         device.destroy_command_pool(command_pool, None);
         device.destroy_pipeline(pipeline, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
@@ -533,19 +559,49 @@ pub fn main() {
     }
 }
 
-fn create_semaphores<D: DeviceV1_0>(device: &D) -> (vk::Semaphore, vk::Semaphore) {
+fn create_sync_objects<D: DeviceV1_0>(
+    device: &D,
+) -> (Vec<vk::Semaphore>, Vec<vk::Semaphore>, Vec<vk::Fence>, Vec<vk::Fence>) {
     let semaphore_info = vk::SemaphoreCreateInfo {
         s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
         p_next: ptr::null(),
         flags: vk::SemaphoreCreateFlags::empty(),
     };
 
-    let s1 = unsafe { device.create_semaphore(&semaphore_info, None) }
-        .expect("Couldn't create semaphore");
-    let s2 = unsafe { device.create_semaphore(&semaphore_info, None) }
-        .expect("Couldn't create semaphore");
+    let fence_info = vk::FenceCreateInfo {
+        s_type: vk::StructureType::FENCE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::FenceCreateFlags::SIGNALED,
+    };
 
-    (s1, s2)
+    let image_available_semaphores = (0..FRAMES_IN_FLIGHT)
+        .map(|_| {
+            unsafe { device.create_semaphore(&semaphore_info, None) }
+                .expect("Couldn't create semaphore")
+        })
+        .collect();
+
+    let render_finished_semaphores = (0..FRAMES_IN_FLIGHT)
+        .map(|_| {
+            unsafe { device.create_semaphore(&semaphore_info, None) }
+                .expect("Couldn't create semaphore")
+        })
+        .collect();
+
+    let in_flight_fences = (0..FRAMES_IN_FLIGHT)
+        .map(|_| unsafe { device.create_fence(&fence_info, None) }.expect("Couldn't create fence"))
+        .collect();
+
+    let images_in_flight = (0..FRAMES_IN_FLIGHT)
+        .map(|_| vk::Fence::null())
+        .collect();
+
+    (
+        image_available_semaphores,
+        render_finished_semaphores,
+        in_flight_fences,
+        images_in_flight,
+    )
 }
 
 fn create_command_pool<D: DeviceV1_0>(device: &D, queue_family_index: u32) -> vk::CommandPool {

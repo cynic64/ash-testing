@@ -290,17 +290,17 @@ impl ExampleBase {
 
         loop {
             let mut exit = false;
-            self.events_loop.borrow_mut().poll_events(|ev| {
-                match ev {
-                    Event::WindowEvent {
-                        event: WindowEvent::CloseRequested,
-                        ..
-                    } => exit = true,
-                    _ => {},
-                }
+            self.events_loop.borrow_mut().poll_events(|ev| match ev {
+                Event::WindowEvent {
+                    event: WindowEvent::CloseRequested,
+                    ..
+                } => exit = true,
+                _ => {}
             });
 
-            if exit { break }
+            if exit {
+                break;
+            }
 
             f();
         }
@@ -371,12 +371,11 @@ impl ExampleBase {
                         .filter_map(|(index, ref info)| {
                             let supports_graphic_and_surface =
                                 info.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                                    && surface_loader
-                                        .get_physical_device_surface_support(
-                                            *pdevice,
-                                            index as u32,
-                                            surface,
-                                        );
+                                    && surface_loader.get_physical_device_surface_support(
+                                        *pdevice,
+                                        index as u32,
+                                        surface,
+                                    );
                             if supports_graphic_and_surface {
                                 Some((*pdevice, index))
                             } else {
