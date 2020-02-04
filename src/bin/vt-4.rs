@@ -436,16 +436,14 @@ pub fn main() {
         image_available_semaphores,
         render_finished_semaphores,
         in_flight_fences,
-        images_in_flight,
-    ) = create_sync_objects(&device);
+        mut images_in_flight,
+    ) = create_sync_objects(&device, image_views.len());
 
     // will also be used to keep track of which set of synchronization
     // primitives to use
     let mut frames_drawn = 0;
 
     loop {
-        println!("start!");
-
         let mut exit = false;
 
         events_loop.poll_events(|ev| match ev {
@@ -482,6 +480,14 @@ pub fn main() {
             )
         }
         .expect("Couldn't acquire next image");
+
+        // make sure the image we just acquired is not in flight
+        if let Some(image_fence) = images_in_flight[image_idx as usize] {
+            unsafe { device.wait_for_fences(&[image_fence], true, std::u64::MAX) }
+                .expect("Couldn't wait for image_in_flight fence");
+        }
+
+        images_in_flight[image_idx as usize] = Some(cur_fence);
 
         // submit command buffer
         let wait_semaphores = [cur_image_available_semaphore];
@@ -529,8 +535,6 @@ pub fn main() {
             .expect("Couldn't present swapchain result");
 
         frames_drawn += 1;
-
-        println!("end!");
     }
 
     unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
@@ -561,7 +565,13 @@ pub fn main() {
 
 fn create_sync_objects<D: DeviceV1_0>(
     device: &D,
-) -> (Vec<vk::Semaphore>, Vec<vk::Semaphore>, Vec<vk::Fence>, Vec<vk::Fence>) {
+    swapchain_image_count: usize,
+) -> (
+    Vec<vk::Semaphore>,
+    Vec<vk::Semaphore>,
+    Vec<vk::Fence>,
+    Vec<Option<vk::Fence>>,
+) {
     let semaphore_info = vk::SemaphoreCreateInfo {
         s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
         p_next: ptr::null(),
@@ -592,9 +602,7 @@ fn create_sync_objects<D: DeviceV1_0>(
         .map(|_| unsafe { device.create_fence(&fence_info, None) }.expect("Couldn't create fence"))
         .collect();
 
-    let images_in_flight = (0..FRAMES_IN_FLIGHT)
-        .map(|_| vk::Fence::null())
-        .collect();
+    let images_in_flight = (0..swapchain_image_count).map(|_| None).collect();
 
     (
         image_available_semaphores,
