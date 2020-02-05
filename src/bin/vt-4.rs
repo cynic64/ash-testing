@@ -12,7 +12,7 @@ use std::ptr;
 use winit::{Event, WindowEvent};
 
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
-const FRAMES_IN_FLIGHT: usize = 2;
+const FRAMES_IN_FLIGHT: usize = 3;
 
 pub fn main() {
     // create winit window
@@ -416,7 +416,6 @@ pub fn main() {
 
     // framebuffer creation
     let framebuffers = create_framebuffers(&device, render_pass, starting_dims, &image_views);
-    dbg![&framebuffers];
 
     // command pool
     let command_pool = create_command_pool(&device, queue_family_index);
@@ -464,12 +463,9 @@ pub fn main() {
             render_finished_semaphores[frames_drawn % FRAMES_IN_FLIGHT];
         let cur_fence = in_flight_fences[frames_drawn % FRAMES_IN_FLIGHT];
 
-        // wait for the fence associated with this swapchain image
+        // wait for the fence associated with this command buffer
         unsafe { device.wait_for_fences(&[cur_fence], true, std::u64::MAX) }
             .expect("Couldn't wait for in_flight fence");
-
-        // reset fence
-        unsafe { device.reset_fences(&[cur_fence]) }.expect("Couldn't reset in_flight fence");
 
         let (image_idx, _is_sub_optimal) = unsafe {
             swapchain_creator.acquire_next_image(
@@ -511,6 +507,9 @@ pub fn main() {
             signal_semaphore_count: 1,
             p_signal_semaphores: signal_semaphores.as_ptr(),
         };
+
+        // reset fence
+        unsafe { device.reset_fences(&[cur_fence]) }.expect("Couldn't reset in_flight fence");
 
         let submissions = [submit_info];
         unsafe { device.queue_submit(queue, &submissions, cur_fence) }
