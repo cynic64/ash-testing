@@ -442,6 +442,9 @@ pub fn main() {
     // primitives to use
     let mut frames_drawn = 0;
 
+    // used to calculate FPS
+    let start_time = std::time::Instant::now();
+
     loop {
         let mut exit = false;
 
@@ -535,6 +538,9 @@ pub fn main() {
 
         frames_drawn += 1;
     }
+
+    println!("FPS: {:.3}", frames_drawn as f64 / get_elapsed(start_time));
+    println!("Average delta in ms: {:.3}", get_elapsed(start_time) / frames_drawn as f64 * 1_000.0);
 
     unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
 
@@ -968,4 +974,8 @@ fn read_shader_code(shader_path: &Path) -> Vec<u8> {
 
 pub fn relative_path(local_path: &str) -> PathBuf {
     [env!("CARGO_MANIFEST_DIR"), local_path].iter().collect()
+}
+
+pub fn get_elapsed(start: std::time::Instant) -> f64 {
+    start.elapsed().as_secs() as f64 + start.elapsed().subsec_nanos() as f64 / 1_000_000_000.0
 }
