@@ -5,9 +5,15 @@ authors = ["maik klein <maikklein@googlemail.com>"]
 edition = "2018"
 
 [dependencies]
-winit = "0.19"
+winit = "0.19.5"
 image = "0.10.4"
+# ash = { path = "../ash" }
 ash = "0.29.0"
 
-[profile.release]
-debug = true
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3.4", features = ["windef", "winuser"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.17.1"
+cocoa = "0.20.0"
+objc = "0.2.7"
