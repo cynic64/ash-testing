@@ -12,7 +12,7 @@ use std::ptr;
 use winit::{Event, WindowEvent};
 
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
-const FRAMES_IN_FLIGHT: usize = 3;
+const FRAMES_IN_FLIGHT: usize = 5;
 
 pub fn main() {
     // create winit window
@@ -172,6 +172,7 @@ pub fn main() {
     // also formats and stuff like that)
     // also returns what dimensions the swapchain should initially be created at
     let starting_dims = check_device_swapchain_caps(&surface_loader, physical_device, surface);
+    dbg![starting_dims];
 
     // create swapchain
     let swapchain_create_info = vk::SwapchainCreateInfoKHR {
@@ -179,7 +180,7 @@ pub fn main() {
         p_next: ptr::null(),
         flags: vk::SwapchainCreateFlagsKHR::empty(),
         surface: surface,
-        min_image_count: 3,
+        min_image_count: 4,
         image_format: SWAPCHAIN_FORMAT,
         image_color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
         image_extent: starting_dims,
@@ -201,6 +202,8 @@ pub fn main() {
 
     let images = unsafe { swapchain_creator.get_swapchain_images(swapchain) }
         .expect("Couldn't get swapchain images");
+
+    println!("Swapchain image count: {}", images.len());
 
     let image_views: Vec<_> = images
         .iter()
@@ -231,6 +234,8 @@ pub fn main() {
                 .expect("Couldn't create image view info")
         })
         .collect();
+
+    dbg![image_views.len()];
 
     // shaders
     let frag_code = read_shader_code(&relative_path("shaders/vt-3/triangle.frag.spv"));
@@ -539,8 +544,8 @@ pub fn main() {
         frames_drawn += 1;
     }
 
-    println!("FPS: {:.3}", frames_drawn as f64 / get_elapsed(start_time));
-    println!("Average delta in ms: {:.3}", get_elapsed(start_time) / frames_drawn as f64 * 1_000.0);
+    println!("FPS: {:.2}", frames_drawn as f64 / get_elapsed(start_time));
+    println!("Average delta in ms: {:.5}", get_elapsed(start_time) / frames_drawn as f64 * 1_000.0);
 
     unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
 
@@ -552,10 +557,15 @@ pub fn main() {
         framebuffers
             .iter()
             .for_each(|fb| device.destroy_framebuffer(*fb, None));
-        /*
-        device.destroy_semaphore(image_available_semaphore, None);
-        device.destroy_semaphore(render_finished_semaphore, None);
-        */
+        image_available_semaphores
+            .iter()
+            .for_each(|sem| device.destroy_semaphore(*sem, None));
+        render_finished_semaphores
+            .iter()
+            .for_each(|sem| device.destroy_semaphore(*sem, None));
+        in_flight_fences
+            .iter()
+            .for_each(|fence| device.destroy_fence(*fence, None));
         device.destroy_command_pool(command_pool, None);
         device.destroy_pipeline(pipeline, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
