@@ -32,7 +32,7 @@ use ash::extensions::mvk::MacOSSurface;
 use winit::{Event, WindowEvent};
 
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
-const FRAMES_IN_FLIGHT: usize = 5;
+const FRAMES_IN_FLIGHT: usize = 8;
 
 pub fn main() {
     // create winit window
@@ -506,10 +506,12 @@ pub fn main() {
         .expect("Couldn't acquire next image");
 
         // make sure the image we just acquired is not in flight
+        /*
         if let Some(image_fence) = images_in_flight[image_idx as usize] {
             unsafe { device.wait_for_fences(&[image_fence], true, std::u64::MAX) }
                 .expect("Couldn't wait for image_in_flight fence");
         }
+        */
 
         images_in_flight[image_idx as usize] = Some(cur_fence);
 
@@ -520,7 +522,7 @@ pub fn main() {
         // the same index in pWaitSemaphores."
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
 
-        let cur_command_buffers = [command_buffers[image_idx as usize]];
+        let cur_command_buffers = [command_buffers[frames_drawn % FRAMES_IN_FLIGHT]];
 
         let signal_semaphores = [cur_render_finished_semaphore];
 
