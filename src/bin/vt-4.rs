@@ -48,9 +48,10 @@ struct SyncSet {
 }
 
 // Command buffers "belong" to a specific swapchain image, because their render
-// pass specifies which framebuffer they render to.
+// pass specifies which framebuffer they render to. The swapchain image itself
+// is not referenced in this struct because they are only ever referred to by
+// their indices.
 struct SwapchainImagePackage {
-    swapchain_image: vk::Image,
     command_buffer: vk::CommandBuffer,
     render_finished_fence: Option<vk::Fence>,
 }
@@ -232,7 +233,7 @@ pub fn main() {
         p_queue_family_indices: ptr::null(),
         pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
         composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
-        present_mode: vk::PresentModeKHR::FIFO,
+        present_mode: vk::PresentModeKHR::IMMEDIATE,
         clipped: vk::TRUE,
         old_swapchain: vk::SwapchainKHR::null(),
     };
@@ -245,7 +246,8 @@ pub fn main() {
         .expect("Couldn't get swapchain images");
 
     println!("Swapchain image count: {}", images.len());
-    println!("Maximum frames in flight: {}", MAX_FRAMES_IN_FLIGHT);
+    println!("Maximum frames in flight: {}
+", MAX_FRAMES_IN_FLIGHT);
     let swapchain_image_count = images.len();
 
     let image_views: Vec<_> = images
@@ -479,11 +481,10 @@ pub fn main() {
         pipeline,
     );
 
-    // combine command buffers and swapchain images into SwapchainImagePackages,
-    // because command buffers can only be used with a specific swapchain images
+    // indices here correspond to swapchain image indices: if acquire_next_image
+    // returns an index of 2, we use the package (and command buffer) at 2.
     let mut swapchain_image_packages: Vec<_> = (0..swapchain_image_count)
         .map(|i| SwapchainImagePackage {
-            swapchain_image: images[i],
             command_buffer: command_buffers[i],
             // will be replaced with a fence representing the previous draw
             // operation performed on this swapchain image once rendering begins
@@ -530,15 +531,26 @@ pub fn main() {
         // is actually available and not being displayed anymore -
         // acquire_next_image will return the instant it knows which image index
         // will be free next, so we need to wait on that semaphore
-        let (image_idx, _is_sub_optimal) = unsafe {
+        let acquire_result = unsafe {
             swapchain_creator.acquire_next_image(
                 swapchain,
                 std::u64::MAX,
                 image_available_semaphore,
                 vk::Fence::null(),
             )
-        }
-        .expect("Couldn't acquire next image");
+        };
+
+        let image_idx = match acquire_result {
+            Ok((image_idx, _is_sub_optimal)) => image_idx,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
+                panic!("swapchain out of date!")
+            },
+            Err(e) => {
+                unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
+                panic!("Unexpected error during acquire_next_image: {}", e)
+            }
+        };
 
         let mut swapchain_image_package = &mut swapchain_image_packages[image_idx as usize];
 
@@ -582,6 +594,7 @@ pub fn main() {
         // somebody else was previously using this fence and we waited until it
         // was signalled (operation completed). now we need to reset it, because
         // we aren't yet done but the fence says we are.
+
         unsafe { device.reset_fences(&[render_finished_fence]) }
             .expect("Couldn't reset render_finished_fence");
 
@@ -915,29 +928,7 @@ fn check_device_swapchain_caps(
 
 // many of these functions are ripped from https://github.com/bwasty/vulkan-tutorial-rs
 
-// only works on linux
-/*
-unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
-    entry: &E,
-    instance: &I,
-    window: &winit::Window,
-) -> Result<vk::SurfaceKHR, vk::Result> {
-    use winit::os::unix::WindowExt;
-
-    let x11_display = window.get_xlib_display().unwrap();
-    let x11_window = window.get_xlib_window().unwrap();
-    let x11_create_info = vk::XlibSurfaceCreateInfoKHR {
-        s_type: vk::StructureType::XLIB_SURFACE_CREATE_INFO_KHR,
-        p_next: ptr::null(),
-        flags: Default::default(),
-        window: x11_window as vk::Window,
-        dpy: x11_display as *mut vk::Display,
-    };
-    let xlib_surface_loader = XlibSurface::new(entry, instance);
-    xlib_surface_loader.create_xlib_surface(&x11_create_info, None)
-}
-*/
-
+// this is ripped from the ash examples
 #[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
 unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     entry: &E,
