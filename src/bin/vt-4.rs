@@ -368,8 +368,8 @@ pub fn main() {
         // is used
         color_write_mask: vk::ColorComponentFlags::R
             | vk::ColorComponentFlags::G
-            | vk::ColorComponentFlags::G
-            | vk::ColorComponentFlags::B,
+            | vk::ColorComponentFlags::B
+            | vk::ColorComponentFlags::A,
     }];
 
     // color blending settings for the whole pipleine
