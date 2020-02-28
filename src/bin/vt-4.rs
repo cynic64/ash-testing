@@ -246,8 +246,11 @@ pub fn main() {
         .expect("Couldn't get swapchain images");
 
     println!("Swapchain image count: {}", images.len());
-    println!("Maximum frames in flight: {}
-", MAX_FRAMES_IN_FLIGHT);
+    println!(
+        "Maximum frames in flight: {}
+",
+        MAX_FRAMES_IN_FLIGHT
+    );
     let swapchain_image_count = images.len();
 
     let image_views: Vec<_> = images
@@ -542,14 +545,8 @@ pub fn main() {
 
         let image_idx = match acquire_result {
             Ok((image_idx, _is_sub_optimal)) => image_idx,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
-                panic!("swapchain out of date!")
-            },
-            Err(e) => {
-                unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
-                panic!("Unexpected error during acquire_next_image: {}", e)
-            }
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => continue,
+            Err(e) => panic!("Unexpected error during acquire_next_image: {}", e),
         };
 
         let mut swapchain_image_package = &mut swapchain_image_packages[image_idx as usize];
@@ -633,28 +630,55 @@ pub fn main() {
 
     // destroy objects
     unsafe {
-        image_views
+        cleanup_swapchain(
+            &device,
+            swapchain_creator,
+            framebuffers,
+            command_pool,
+            command_buffers,
+            pipeline,
+            pipeline_layout,
+            render_pass,
+            image_views,
+            swapchain,
+        );
+        sync_sets.iter().for_each(|set| {
+            device.destroy_semaphore(set.image_available_semaphore, None);
+            device.destroy_semaphore(set.render_finished_semaphore, None);
+            device.destroy_fence(set.render_finished_fence, None);
+        });
+        device.destroy_command_pool(command_pool, None);
+        device.destroy_device(None);
+        surface_loader.destroy_surface(surface, None);
+        debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
+        instance.destroy_instance(None);
+    }
+}
+
+fn cleanup_swapchain<D: DeviceV1_0>(
+    device: &D,
+    swapchain_creator: Swapchain,
+    framebuffers: Vec<vk::Framebuffer>,
+    command_pool: vk::CommandPool,
+    command_buffers: Vec<vk::CommandBuffer>,
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
+    render_pass: vk::RenderPass,
+    swapchain_image_views: Vec<vk::ImageView>,
+    swapchain: vk::SwapchainKHR,
+) {
+    unsafe {
+        swapchain_image_views
             .iter()
             .for_each(|iv| device.destroy_image_view(*iv, None));
         framebuffers
             .iter()
             .for_each(|fb| device.destroy_framebuffer(*fb, None));
-        sync_sets
-            .iter()
-            .for_each(|set| {
-                device.destroy_semaphore(set.image_available_semaphore, None);
-                device.destroy_semaphore(set.render_finished_semaphore, None);
-                device.destroy_fence(set.render_finished_fence, None);
-            });
-        device.destroy_command_pool(command_pool, None);
+        device.free_command_buffers(command_pool, &command_buffers);
         device.destroy_pipeline(pipeline, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
         swapchain_creator.destroy_swapchain(swapchain, None);
         device.destroy_render_pass(render_pass, None);
-        device.destroy_device(None);
-        surface_loader.destroy_surface(surface, None);
-        debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
-        instance.destroy_instance(None);
     }
 }
 
