@@ -210,51 +210,18 @@ pub fn main() {
     // get queue (0 = take first queue)
     let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
-    let (swapchain_creator, swapchain, swapchain_dims) =
-        create_swapchain(instance.clone(), device.clone(), physical_device, &surface_loader, surface);
-
-    let images = unsafe { swapchain_creator.get_swapchain_images(swapchain) }
-        .expect("Couldn't get swapchain images");
-
-    println!("Swapchain image count: {}", images.len());
-    println!(
-        "Maximum frames in flight: {}
-",
-        MAX_FRAMES_IN_FLIGHT
+    let (swapchain_creator, swapchain, swapchain_images, swapchain_dims) = create_swapchain(
+        instance.clone(),
+        device.clone(),
+        physical_device,
+        &surface_loader,
+        surface,
     );
-    let swapchain_image_count = images.len();
 
-    let image_views: Vec<_> = images
-        .iter()
-        .map(|image| {
-            let iv_info = vk::ImageViewCreateInfo {
-                s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
-                p_next: ptr::null(),
-                flags: vk::ImageViewCreateFlags::empty(),
-                image: *image,
-                view_type: vk::ImageViewType::TYPE_2D,
-                format: SWAPCHAIN_FORMAT,
-                components: vk::ComponentMapping {
-                    r: vk::ComponentSwizzle::IDENTITY,
-                    g: vk::ComponentSwizzle::IDENTITY,
-                    b: vk::ComponentSwizzle::IDENTITY,
-                    a: vk::ComponentSwizzle::IDENTITY,
-                },
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-            };
+    println!("Swapchain image count: {}", swapchain_images.len());
+    println!("Maximum frames in flight: {} ", MAX_FRAMES_IN_FLIGHT);
 
-            unsafe { device.create_image_view(&iv_info, None) }
-                .expect("Couldn't create image view info")
-        })
-        .collect();
-
-    dbg![image_views.len()];
+    let swapchain_image_views = create_swapchain_image_views(&device, &swapchain_images);
 
     // shaders
     let frag_code = read_shader_code(&relative_path("shaders/vt-3/triangle.frag.spv"));
@@ -287,150 +254,20 @@ pub fn main() {
 
     let shader_stages = [vert_stage_info, frag_stage_info];
 
-    // fixed-function pipeline settings
-
-    // a.k.a vertex format
-    // we don't really have a format since they are hard-coded into the vertex
-    // shader for now
-    let pipeline_vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
-
-    let pipeline_input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo {
-        s_type: vk::StructureType::PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::PipelineInputAssemblyStateCreateFlags::empty(),
-        topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-        primitive_restart_enable: vk::FALSE,
-    };
-
-    let viewports = [vk::Viewport {
-        x: 0.0,
-        y: 0.0,
-        width: swapchain_dims.width as f32,
-        height: swapchain_dims.height as f32,
-        min_depth: 0.0,
-        max_depth: 1.0,
-    }];
-
-    let scissors = [vk::Rect2D {
-        offset: vk::Offset2D { x: 0, y: 0 },
-        extent: swapchain_dims,
-    }];
-
-    let viewport_state = vk::PipelineViewportStateCreateInfo {
-        s_type: vk::StructureType::PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::PipelineViewportStateCreateFlags::empty(),
-        viewport_count: viewports.len() as u32,
-        p_viewports: viewports.as_ptr(),
-        scissor_count: scissors.len() as u32,
-        p_scissors: scissors.as_ptr(),
-    };
-
-    let pipeline_rasterization_info = vk::PipelineRasterizationStateCreateInfo {
-        s_type: vk::StructureType::PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::PipelineRasterizationStateCreateFlags::empty(),
-        depth_clamp_enable: vk::FALSE,
-        rasterizer_discard_enable: vk::FALSE,
-        polygon_mode: vk::PolygonMode::FILL,
-        cull_mode: vk::CullModeFlags::NONE,
-        front_face: vk::FrontFace::CLOCKWISE,
-        depth_bias_enable: vk::FALSE,
-        depth_bias_constant_factor: 0.0,
-        depth_bias_clamp: 0.0,
-        depth_bias_slope_factor: 0.0,
-        line_width: 1.0,
-    };
-
-    let pipeline_multisample_info = vk::PipelineMultisampleStateCreateInfo {
-        s_type: vk::StructureType::PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::PipelineMultisampleStateCreateFlags::empty(),
-        rasterization_samples: vk::SampleCountFlags::TYPE_1,
-        sample_shading_enable: vk::FALSE,
-        min_sample_shading: 1.0,
-        p_sample_mask: ptr::null(),
-        alpha_to_coverage_enable: vk::FALSE,
-        alpha_to_one_enable: vk::FALSE,
-    };
-
-    // color blending info per framebuffer
-    let pipeline_color_blend_attachment_infos = [vk::PipelineColorBlendAttachmentState {
-        blend_enable: vk::FALSE,
-        // not used because we disabled blending
-        src_color_blend_factor: vk::BlendFactor::ONE,
-        dst_color_blend_factor: vk::BlendFactor::ZERO,
-        color_blend_op: vk::BlendOp::ADD,
-        src_alpha_blend_factor: vk::BlendFactor::ONE,
-        dst_alpha_blend_factor: vk::BlendFactor::ZERO,
-        alpha_blend_op: vk::BlendOp::ADD,
-
-        // is used
-        color_write_mask: vk::ColorComponentFlags::R
-            | vk::ColorComponentFlags::G
-            | vk::ColorComponentFlags::B
-            | vk::ColorComponentFlags::A,
-    }];
-
-    // color blending settings for the whole pipleine
-    let pipeline_color_blend_info = vk::PipelineColorBlendStateCreateInfo {
-        s_type: vk::StructureType::PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::PipelineColorBlendStateCreateFlags::empty(),
-        logic_op_enable: vk::FALSE,
-        logic_op: vk::LogicOp::COPY, // optional
-        attachment_count: pipeline_color_blend_attachment_infos.len() as u32,
-        p_attachments: pipeline_color_blend_attachment_infos.as_ptr(),
-        blend_constants: [0.0, 0.0, 0.0, 0.0], // optional
-    };
-
-    // we don't use any shader uniforms so we leave it empty
-    let pipeline_layout_info = vk::PipelineLayoutCreateInfo {
-        s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::PipelineLayoutCreateFlags::empty(),
-        set_layout_count: 0,
-        p_set_layouts: ptr::null(),
-        push_constant_range_count: 0,
-        p_push_constant_ranges: ptr::null(),
-    };
-
-    let pipeline_layout = unsafe {
-        device
-            .create_pipeline_layout(&pipeline_layout_info, None)
-            .expect("Couldn't create pipeline layout!")
-    };
-
     // render pass
     let render_pass = create_render_pass(&device);
 
-    // pipeline
-    let pipeline_infos = [vk::GraphicsPipelineCreateInfo {
-        s_type: vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::PipelineCreateFlags::empty(),
-        stage_count: shader_stages.len() as u32,
-        p_stages: shader_stages.as_ptr(),
-        p_vertex_input_state: &pipeline_vertex_input_info,
-        p_input_assembly_state: &pipeline_input_assembly_info,
-        p_tessellation_state: ptr::null(),
-        p_viewport_state: &viewport_state,
-        p_rasterization_state: &pipeline_rasterization_info,
-        p_multisample_state: &pipeline_multisample_info,
-        p_depth_stencil_state: ptr::null(),
-        p_color_blend_state: &pipeline_color_blend_info,
-        p_dynamic_state: ptr::null(),
-        layout: pipeline_layout,
-        render_pass,
-        subpass: 0,
-        base_pipeline_handle: vk::Pipeline::null(),
-        base_pipeline_index: 0,
-    }];
+    // pipeline layout
+    let pipeline_layout = create_pipeline_layout(&device);
 
-    let pipeline = unsafe {
-        device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_infos, None)
-    }
-    .expect("Couldn't create graphics pipeline")[0];
+    // pipeline
+    let pipeline = create_pipeline(
+        &device,
+        render_pass,
+        pipeline_layout,
+        swapchain_dims,
+        shader_stages,
+    );
 
     // shader modules only need to live long enough to create the pipeline
     unsafe {
@@ -439,7 +276,8 @@ pub fn main() {
     }
 
     // framebuffer creation
-    let framebuffers = create_framebuffers(&device, render_pass, swapchain_dims, &image_views);
+    let framebuffers =
+        create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
 
     // command pool
     let command_pool = create_command_pool(&device, queue_family_index);
@@ -457,7 +295,7 @@ pub fn main() {
 
     // indices here correspond to swapchain image indices: if acquire_next_image
     // returns an index of 2, we use the package (and command buffer) at 2.
-    let mut swapchain_image_packages: Vec<_> = (0..swapchain_image_count)
+    let mut swapchain_image_packages: Vec<_> = (0..swapchain_images.len())
         .map(|i| SwapchainImagePackage {
             command_buffer: command_buffers[i],
             // will be replaced with a fence representing the previous draw
@@ -610,7 +448,7 @@ pub fn main() {
             pipeline,
             pipeline_layout,
             render_pass,
-            image_views,
+            swapchain_image_views,
             swapchain,
         );
         sync_sets.iter().for_each(|set| {
@@ -632,7 +470,7 @@ fn create_swapchain<D: DeviceV1_0, I: InstanceV1_0>(
     physical_device: vk::PhysicalDevice,
     surface_loader: &Surface,
     surface: vk::SurfaceKHR,
-) -> (Swapchain, vk::SwapchainKHR, vk::Extent2D) {
+) -> (Swapchain, vk::SwapchainKHR, Vec<vk::Image>, vk::Extent2D) {
     // check device swapchain capabilties (not just that it has the extension,
     // also formats and stuff like that)
     // also returns what dimensions the swapchain should initially be created at
@@ -661,10 +499,197 @@ fn create_swapchain<D: DeviceV1_0, I: InstanceV1_0>(
     };
 
     let creator = Swapchain::new(&instance, &device);
-    let swapchain = unsafe { creator.create_swapchain(&create_info, None) }
-        .expect("Couldn't create swapchain");
+    let swapchain =
+        unsafe { creator.create_swapchain(&create_info, None) }.expect("Couldn't create swapchain");
 
-    (creator, swapchain, dimensions)
+    let images =
+        unsafe { creator.get_swapchain_images(swapchain) }.expect("Couldn't get swapchain images");
+
+    (creator, swapchain, images, dimensions)
+}
+
+fn create_swapchain_image_views<D: DeviceV1_0>(
+    device: &D,
+    images: &[vk::Image],
+) -> Vec<vk::ImageView> {
+    images
+        .iter()
+        .map(|image| {
+            let iv_info = vk::ImageViewCreateInfo {
+                s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+                p_next: ptr::null(),
+                flags: vk::ImageViewCreateFlags::empty(),
+                image: *image,
+                view_type: vk::ImageViewType::TYPE_2D,
+                format: SWAPCHAIN_FORMAT,
+                components: vk::ComponentMapping {
+                    r: vk::ComponentSwizzle::IDENTITY,
+                    g: vk::ComponentSwizzle::IDENTITY,
+                    b: vk::ComponentSwizzle::IDENTITY,
+                    a: vk::ComponentSwizzle::IDENTITY,
+                },
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+            };
+
+            unsafe { device.create_image_view(&iv_info, None) }
+                .expect("Couldn't create image view info")
+        })
+        .collect()
+}
+
+fn create_pipeline<D: DeviceV1_0>(
+    device: &D,
+    render_pass: vk::RenderPass,
+    pipeline_layout: vk::PipelineLayout,
+    swapchain_dims: vk::Extent2D,
+    shader_stages: [vk::PipelineShaderStageCreateInfo; 2],
+) -> vk::Pipeline {
+    // a.k.a vertex format
+    // we don't really have a format since they are hard-coded into the vertex
+    // shader for now
+    let pipeline_vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+
+    let pipeline_input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineInputAssemblyStateCreateFlags::empty(),
+        topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+        primitive_restart_enable: vk::FALSE,
+    };
+
+    let viewports = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: swapchain_dims.width as f32,
+        height: swapchain_dims.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+
+    let scissors = [vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: swapchain_dims,
+    }];
+
+    let viewport_state = vk::PipelineViewportStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineViewportStateCreateFlags::empty(),
+        viewport_count: viewports.len() as u32,
+        p_viewports: viewports.as_ptr(),
+        scissor_count: scissors.len() as u32,
+        p_scissors: scissors.as_ptr(),
+    };
+
+    let pipeline_rasterization_info = vk::PipelineRasterizationStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineRasterizationStateCreateFlags::empty(),
+        depth_clamp_enable: vk::FALSE,
+        rasterizer_discard_enable: vk::FALSE,
+        polygon_mode: vk::PolygonMode::FILL,
+        cull_mode: vk::CullModeFlags::NONE,
+        front_face: vk::FrontFace::CLOCKWISE,
+        depth_bias_enable: vk::FALSE,
+        depth_bias_constant_factor: 0.0,
+        depth_bias_clamp: 0.0,
+        depth_bias_slope_factor: 0.0,
+        line_width: 1.0,
+    };
+
+    let pipeline_multisample_info = vk::PipelineMultisampleStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineMultisampleStateCreateFlags::empty(),
+        rasterization_samples: vk::SampleCountFlags::TYPE_1,
+        sample_shading_enable: vk::FALSE,
+        min_sample_shading: 1.0,
+        p_sample_mask: ptr::null(),
+        alpha_to_coverage_enable: vk::FALSE,
+        alpha_to_one_enable: vk::FALSE,
+    };
+
+    // color blending info per framebuffer
+    let pipeline_color_blend_attachment_infos = [vk::PipelineColorBlendAttachmentState {
+        blend_enable: vk::FALSE,
+        // not used because we disabled blending
+        src_color_blend_factor: vk::BlendFactor::ONE,
+        dst_color_blend_factor: vk::BlendFactor::ZERO,
+        color_blend_op: vk::BlendOp::ADD,
+        src_alpha_blend_factor: vk::BlendFactor::ONE,
+        dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+        alpha_blend_op: vk::BlendOp::ADD,
+
+        // is used
+        color_write_mask: vk::ColorComponentFlags::R
+            | vk::ColorComponentFlags::G
+            | vk::ColorComponentFlags::B
+            | vk::ColorComponentFlags::A,
+    }];
+
+    // color blending settings for the whole pipleine
+    let pipeline_color_blend_info = vk::PipelineColorBlendStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineColorBlendStateCreateFlags::empty(),
+        logic_op_enable: vk::FALSE,
+        logic_op: vk::LogicOp::COPY, // optional
+        attachment_count: pipeline_color_blend_attachment_infos.len() as u32,
+        p_attachments: pipeline_color_blend_attachment_infos.as_ptr(),
+        blend_constants: [0.0, 0.0, 0.0, 0.0], // optional
+    };
+
+    let pipeline_infos = [vk::GraphicsPipelineCreateInfo {
+        s_type: vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineCreateFlags::empty(),
+        stage_count: shader_stages.len() as u32,
+        p_stages: shader_stages.as_ptr(),
+        p_vertex_input_state: &pipeline_vertex_input_info,
+        p_input_assembly_state: &pipeline_input_assembly_info,
+        p_tessellation_state: ptr::null(),
+        p_viewport_state: &viewport_state,
+        p_rasterization_state: &pipeline_rasterization_info,
+        p_multisample_state: &pipeline_multisample_info,
+        p_depth_stencil_state: ptr::null(),
+        p_color_blend_state: &pipeline_color_blend_info,
+        p_dynamic_state: ptr::null(),
+        layout: pipeline_layout,
+        render_pass,
+        subpass: 0,
+        base_pipeline_handle: vk::Pipeline::null(),
+        base_pipeline_index: 0,
+    }];
+
+    unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_infos, None) }
+        .expect("Couldn't create graphics pipeline")[0]
+}
+
+fn create_pipeline_layout<D: DeviceV1_0>(device: &D) -> vk::PipelineLayout {
+    // fixed-function pipeline settings
+
+    // we don't use any shader uniforms so we leave it empty
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo {
+        s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineLayoutCreateFlags::empty(),
+        set_layout_count: 0,
+        p_set_layouts: ptr::null(),
+        push_constant_range_count: 0,
+        p_push_constant_ranges: ptr::null(),
+    };
+
+    unsafe {
+        device
+            .create_pipeline_layout(&pipeline_layout_info, None)
+            .expect("Couldn't create pipeline layout!")
+    }
 }
 
 fn cleanup_swapchain<D: DeviceV1_0>(
