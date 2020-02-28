@@ -47,7 +47,7 @@ struct SyncSet {
     render_finished_fence: vk::Fence,
 }
 
-// Command buffers "belong" to a specific swapchain image, because their render
+// command buffers "belong" to a specific swapchain image, because their render
 // pass specifies which framebuffer they render to. The swapchain image itself
 // is not referenced in this struct because they are only ever referred to by
 // their indices.
@@ -210,37 +210,8 @@ pub fn main() {
     // get queue (0 = take first queue)
     let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
-    // check device swapchain capabilties (not just that it has the extension,
-    // also formats and stuff like that)
-    // also returns what dimensions the swapchain should initially be created at
-    let starting_dims = check_device_swapchain_caps(&surface_loader, physical_device, surface);
-    dbg![starting_dims];
-
-    // create swapchain
-    let swapchain_create_info = vk::SwapchainCreateInfoKHR {
-        s_type: vk::StructureType::SWAPCHAIN_CREATE_INFO_KHR,
-        p_next: ptr::null(),
-        flags: vk::SwapchainCreateFlagsKHR::empty(),
-        surface: surface,
-        min_image_count: 2,
-        image_format: SWAPCHAIN_FORMAT,
-        image_color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
-        image_extent: starting_dims,
-        image_array_layers: 1,
-        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
-        image_sharing_mode: vk::SharingMode::EXCLUSIVE,
-        queue_family_index_count: 0,
-        p_queue_family_indices: ptr::null(),
-        pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
-        composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
-        present_mode: vk::PresentModeKHR::IMMEDIATE,
-        clipped: vk::TRUE,
-        old_swapchain: vk::SwapchainKHR::null(),
-    };
-
-    let swapchain_creator = Swapchain::new(&instance, &device);
-    let swapchain = unsafe { swapchain_creator.create_swapchain(&swapchain_create_info, None) }
-        .expect("Couldn't create swapchain");
+    let (swapchain_creator, swapchain, swapchain_dims) =
+        create_swapchain(instance.clone(), device.clone(), physical_device, &surface_loader, surface);
 
     let images = unsafe { swapchain_creator.get_swapchain_images(swapchain) }
         .expect("Couldn't get swapchain images");
@@ -334,15 +305,15 @@ pub fn main() {
     let viewports = [vk::Viewport {
         x: 0.0,
         y: 0.0,
-        width: starting_dims.width as f32,
-        height: starting_dims.height as f32,
+        width: swapchain_dims.width as f32,
+        height: swapchain_dims.height as f32,
         min_depth: 0.0,
         max_depth: 1.0,
     }];
 
     let scissors = [vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
-        extent: starting_dims,
+        extent: swapchain_dims,
     }];
 
     let viewport_state = vk::PipelineViewportStateCreateInfo {
@@ -468,7 +439,7 @@ pub fn main() {
     }
 
     // framebuffer creation
-    let framebuffers = create_framebuffers(&device, render_pass, starting_dims, &image_views);
+    let framebuffers = create_framebuffers(&device, render_pass, swapchain_dims, &image_views);
 
     // command pool
     let command_pool = create_command_pool(&device, queue_family_index);
@@ -479,7 +450,7 @@ pub fn main() {
         &device,
         render_pass,
         command_pool,
-        starting_dims,
+        swapchain_dims,
         &framebuffers,
         pipeline,
     );
@@ -653,6 +624,47 @@ pub fn main() {
         debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
         instance.destroy_instance(None);
     }
+}
+
+fn create_swapchain<D: DeviceV1_0, I: InstanceV1_0>(
+    instance: I,
+    device: D,
+    physical_device: vk::PhysicalDevice,
+    surface_loader: &Surface,
+    surface: vk::SurfaceKHR,
+) -> (Swapchain, vk::SwapchainKHR, vk::Extent2D) {
+    // check device swapchain capabilties (not just that it has the extension,
+    // also formats and stuff like that)
+    // also returns what dimensions the swapchain should initially be created at
+    let dimensions = check_device_swapchain_caps(surface_loader, physical_device, surface);
+
+    // create swapchain
+    let create_info = vk::SwapchainCreateInfoKHR {
+        s_type: vk::StructureType::SWAPCHAIN_CREATE_INFO_KHR,
+        p_next: ptr::null(),
+        flags: vk::SwapchainCreateFlagsKHR::empty(),
+        surface: surface,
+        min_image_count: 2,
+        image_format: SWAPCHAIN_FORMAT,
+        image_color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+        image_extent: dimensions,
+        image_array_layers: 1,
+        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        image_sharing_mode: vk::SharingMode::EXCLUSIVE,
+        queue_family_index_count: 0,
+        p_queue_family_indices: ptr::null(),
+        pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
+        composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
+        present_mode: vk::PresentModeKHR::IMMEDIATE,
+        clipped: vk::TRUE,
+        old_swapchain: vk::SwapchainKHR::null(),
+    };
+
+    let creator = Swapchain::new(&instance, &device);
+    let swapchain = unsafe { creator.create_swapchain(&create_info, None) }
+        .expect("Couldn't create swapchain");
+
+    (creator, swapchain, dimensions)
 }
 
 fn cleanup_swapchain<D: DeviceV1_0>(
