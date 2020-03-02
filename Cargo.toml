@@ -17,3 +17,6 @@ winapi = { version = "0.3.4", features = ["windef", "winuser"] }
 metal = "0.17.1"
 cocoa = "0.20.0"
 objc = "0.2.7"
+
+[profile.release]
+debug = true

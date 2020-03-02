@@ -210,18 +210,19 @@ pub fn main() {
     // get queue (0 = take first queue)
     let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
-    let (swapchain_creator, swapchain, swapchain_images, swapchain_dims) = create_swapchain(
-        instance.clone(),
-        device.clone(),
+    let swapchain_creator = Swapchain::new(&instance, &device);
+
+    let (mut swapchain, mut swapchain_images, mut swapchain_dims) = create_swapchain(
         physical_device,
         &surface_loader,
         surface,
+        &swapchain_creator,
     );
 
     println!("Swapchain image count: {}", swapchain_images.len());
     println!("Maximum frames in flight: {} ", MAX_FRAMES_IN_FLIGHT);
 
-    let swapchain_image_views = create_swapchain_image_views(&device, &swapchain_images);
+    let mut swapchain_image_views = create_swapchain_image_views(&device, &swapchain_images);
 
     // shaders
     let frag_code = read_shader_code(&relative_path("shaders/vt-3/triangle.frag.spv"));
@@ -261,7 +262,7 @@ pub fn main() {
     let pipeline_layout = create_pipeline_layout(&device);
 
     // pipeline
-    let pipeline = create_pipeline(
+    let mut pipeline = create_pipeline(
         &device,
         render_pass,
         pipeline_layout,
@@ -269,14 +270,8 @@ pub fn main() {
         shader_stages,
     );
 
-    // shader modules only need to live long enough to create the pipeline
-    unsafe {
-        device.destroy_shader_module(frag_module, None);
-        device.destroy_shader_module(vert_module, None);
-    }
-
     // framebuffer creation
-    let framebuffers =
+    let mut framebuffers =
         create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
 
     // command pool
@@ -284,7 +279,7 @@ pub fn main() {
 
     // command buffers (re-used between frames)
     // each command buffer corresponds to a specific swapchain image
-    let command_buffers = create_command_buffers(
+    let mut command_buffers = create_command_buffers(
         &device,
         render_pass,
         command_pool,
@@ -295,14 +290,8 @@ pub fn main() {
 
     // indices here correspond to swapchain image indices: if acquire_next_image
     // returns an index of 2, we use the package (and command buffer) at 2.
-    let mut swapchain_image_packages: Vec<_> = (0..swapchain_images.len())
-        .map(|i| SwapchainImagePackage {
-            command_buffer: command_buffers[i],
-            // will be replaced with a fence representing the previous draw
-            // operation performed on this swapchain image once rendering begins
-            render_finished_fence: None,
-        })
-        .collect();
+    let mut swapchain_image_packages =
+        create_swapchain_image_packages(swapchain_images.len(), &command_buffers);
 
     // sync objects (do not correspond to swapchain images)
     let sync_sets = create_sync_objects(&device);
@@ -311,6 +300,8 @@ pub fn main() {
     // (remember, it's independent from which swapchain image is being used)
     let mut frames_drawn = 0;
     let start_time = std::time::Instant::now();
+
+    let mut must_recreate_swapchain = false;
 
     loop {
         let mut exit = false;
@@ -325,6 +316,72 @@ pub fn main() {
 
         if exit {
             break;
+        }
+
+        if must_recreate_swapchain {
+            unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
+
+            // Cleanup_swapchain requires ownership of these to destroy
+            // them. They will be re-created later. Technically I think it
+            // would also work to pass pointers to cleanup_swapchain instead
+            // of transferring ownership, but I don't like the idea of that
+            // because then values in command_buffers and framebuffers would
+            // point to destroyed vulkan objects.
+            let our_framebuffers = std::mem::replace(&mut framebuffers, vec![]);
+            let our_command_buffers = std::mem::replace(&mut command_buffers, vec![]);
+            let our_swapchain_image_views = std::mem::replace(&mut swapchain_image_views, vec![]);
+
+            cleanup_swapchain(
+                &device,
+                &swapchain_creator,
+                our_framebuffers,
+                command_pool,
+                our_command_buffers,
+                pipeline,
+                our_swapchain_image_views,
+                swapchain,
+            );
+
+            // re-create swapchain
+            let ret = create_swapchain(
+                physical_device,
+                &surface_loader,
+                surface,
+                &swapchain_creator,
+            );
+
+            swapchain = ret.0;
+            swapchain_images = ret.1;
+            swapchain_dims = ret.2;
+
+            // re-create image views
+            swapchain_image_views = create_swapchain_image_views(&device, &swapchain_images);
+
+            // re-create graphics pipeline
+            pipeline = create_pipeline(
+                &device,
+                render_pass,
+                pipeline_layout,
+                swapchain_dims,
+                shader_stages,
+            );
+
+            // re-create framebuffers
+            // framebuffer creation
+            framebuffers =
+                create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
+
+            // re-create command buffers
+            command_buffers = create_command_buffers(
+                &device,
+                render_pass,
+                command_pool,
+                swapchain_dims,
+                &framebuffers,
+                pipeline,
+            );
+
+            must_recreate_swapchain = false;
         }
 
         let sync_set = &sync_sets[frames_drawn % MAX_FRAMES_IN_FLIGHT];
@@ -354,7 +411,10 @@ pub fn main() {
 
         let image_idx = match acquire_result {
             Ok((image_idx, _is_sub_optimal)) => image_idx,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => continue,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                must_recreate_swapchain = true;
+                continue;
+            }
             Err(e) => panic!("Unexpected error during acquire_next_image: {}", e),
         };
 
@@ -400,7 +460,6 @@ pub fn main() {
         // somebody else was previously using this fence and we waited until it
         // was signalled (operation completed). now we need to reset it, because
         // we aren't yet done but the fence says we are.
-
         unsafe { device.reset_fences(&[render_finished_fence]) }
             .expect("Couldn't reset render_finished_fence");
 
@@ -423,8 +482,15 @@ pub fn main() {
             p_results: ptr::null_mut(),
         };
 
-        unsafe { swapchain_creator.queue_present(queue, &present_info) }
-            .expect("Couldn't present swapchain result");
+        match unsafe { swapchain_creator.queue_present(queue, &present_info) } {
+            Ok(_idk_what_this_is) => (),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                must_recreate_swapchain = true;
+                continue;
+            }
+            Err(e) => panic!("Unexpected error during queue_present: {}", e),
+        };
+
 
         frames_drawn += 1;
     }
@@ -439,18 +505,20 @@ pub fn main() {
 
     // destroy objects
     unsafe {
+        device.destroy_shader_module(frag_module, None);
+        device.destroy_shader_module(vert_module, None);
         cleanup_swapchain(
             &device,
-            swapchain_creator,
+            &swapchain_creator,
             framebuffers,
             command_pool,
             command_buffers,
             pipeline,
-            pipeline_layout,
-            render_pass,
             swapchain_image_views,
             swapchain,
         );
+        device.destroy_pipeline_layout(pipeline_layout, None);
+        device.destroy_render_pass(render_pass, None);
         sync_sets.iter().for_each(|set| {
             device.destroy_semaphore(set.image_available_semaphore, None);
             device.destroy_semaphore(set.render_finished_semaphore, None);
@@ -464,17 +532,18 @@ pub fn main() {
     }
 }
 
-fn create_swapchain<D: DeviceV1_0, I: InstanceV1_0>(
-    instance: I,
-    device: D,
+fn create_swapchain(
     physical_device: vk::PhysicalDevice,
     surface_loader: &Surface,
     surface: vk::SurfaceKHR,
-) -> (Swapchain, vk::SwapchainKHR, Vec<vk::Image>, vk::Extent2D) {
+    swapchain_creator: &Swapchain,
+) -> (vk::SwapchainKHR, Vec<vk::Image>, vk::Extent2D) {
     // check device swapchain capabilties (not just that it has the extension,
     // also formats and stuff like that)
     // also returns what dimensions the swapchain should initially be created at
     let dimensions = check_device_swapchain_caps(surface_loader, physical_device, surface);
+
+    // for now, the format is fixed - might be good to change later.
 
     // create swapchain
     let create_info = vk::SwapchainCreateInfoKHR {
@@ -498,14 +567,13 @@ fn create_swapchain<D: DeviceV1_0, I: InstanceV1_0>(
         old_swapchain: vk::SwapchainKHR::null(),
     };
 
-    let creator = Swapchain::new(&instance, &device);
-    let swapchain =
-        unsafe { creator.create_swapchain(&create_info, None) }.expect("Couldn't create swapchain");
+    let swapchain = unsafe { swapchain_creator.create_swapchain(&create_info, None) }
+        .expect("Couldn't create swapchain");
 
-    let images =
-        unsafe { creator.get_swapchain_images(swapchain) }.expect("Couldn't get swapchain images");
+    let images = unsafe { swapchain_creator.get_swapchain_images(swapchain) }
+        .expect("Couldn't get swapchain images");
 
-    (creator, swapchain, images, dimensions)
+    (swapchain, images, dimensions)
 }
 
 fn create_swapchain_image_views<D: DeviceV1_0>(
@@ -692,30 +760,40 @@ fn create_pipeline_layout<D: DeviceV1_0>(device: &D) -> vk::PipelineLayout {
     }
 }
 
+fn create_swapchain_image_packages(
+    swapchain_image_count: usize,
+    command_buffers: &[vk::CommandBuffer],
+) -> Vec<SwapchainImagePackage> {
+    (0..swapchain_image_count)
+        .map(|i| SwapchainImagePackage {
+            command_buffer: command_buffers[i],
+            // will be replaced with a fence representing the previous draw
+            // operation performed on this swapchain image once rendering begins
+            render_finished_fence: None,
+        })
+        .collect()
+}
+
 fn cleanup_swapchain<D: DeviceV1_0>(
     device: &D,
-    swapchain_creator: Swapchain,
+    swapchain_creator: &Swapchain,
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
     pipeline: vk::Pipeline,
-    pipeline_layout: vk::PipelineLayout,
-    render_pass: vk::RenderPass,
     swapchain_image_views: Vec<vk::ImageView>,
     swapchain: vk::SwapchainKHR,
 ) {
     unsafe {
+        device.free_command_buffers(command_pool, &command_buffers);
         swapchain_image_views
             .iter()
             .for_each(|iv| device.destroy_image_view(*iv, None));
         framebuffers
             .iter()
             .for_each(|fb| device.destroy_framebuffer(*fb, None));
-        device.free_command_buffers(command_pool, &command_buffers);
         device.destroy_pipeline(pipeline, None);
-        device.destroy_pipeline_layout(pipeline_layout, None);
         swapchain_creator.destroy_swapchain(swapchain, None);
-        device.destroy_render_pass(render_pass, None);
     }
 }
 
