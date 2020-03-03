@@ -304,20 +304,6 @@ pub fn main() {
     let mut must_recreate_swapchain = false;
 
     loop {
-        let mut exit = false;
-
-        events_loop.poll_events(|ev| match ev {
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => exit = true,
-            _ => {}
-        });
-
-        if exit {
-            break;
-        }
-
         if must_recreate_swapchain {
             unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
 
@@ -381,7 +367,26 @@ pub fn main() {
                 pipeline,
             );
 
+            swapchain_image_packages =
+                create_swapchain_image_packages(swapchain_images.len(), &command_buffers);
+
+            // frames_drawn = 0;
+
             must_recreate_swapchain = false;
+        }
+
+        let mut exit = false;
+
+        events_loop.poll_events(|ev| match ev {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => exit = true,
+            _ => {}
+        });
+
+        if exit {
+            break;
         }
 
         let sync_set = &sync_sets[frames_drawn % MAX_FRAMES_IN_FLIGHT];
@@ -441,7 +446,7 @@ pub fn main() {
         // the same index in pWaitSemaphores."
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
 
-        let command_buffers = [swapchain_image_package.command_buffer];
+        let cur_command_buffers = [swapchain_image_package.command_buffer];
 
         let signal_semaphores = [render_finished_semaphore];
 
@@ -452,7 +457,7 @@ pub fn main() {
             p_wait_semaphores: wait_semaphores.as_ptr(),
             p_wait_dst_stage_mask: wait_stages.as_ptr(),
             command_buffer_count: 1,
-            p_command_buffers: command_buffers.as_ptr(),
+            p_command_buffers: cur_command_buffers.as_ptr(),
             signal_semaphore_count: 1,
             p_signal_semaphores: signal_semaphores.as_ptr(),
         };
@@ -490,7 +495,6 @@ pub fn main() {
             }
             Err(e) => panic!("Unexpected error during queue_present: {}", e),
         };
-
 
         frames_drawn += 1;
     }
