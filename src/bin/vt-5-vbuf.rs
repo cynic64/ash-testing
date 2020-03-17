@@ -462,8 +462,6 @@ pub fn main() {
             swapchain_image_packages =
                 create_swapchain_image_packages(swapchain_images.len(), &command_buffers);
 
-            // frames_drawn = 0;
-
             must_recreate_swapchain = false;
         }
 
