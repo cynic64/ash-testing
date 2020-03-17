@@ -9,6 +9,8 @@ use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 
+const MAX_FRAMES_IN_FLIGHT: usize = 4;
+
 #[cfg(target_os = "macos")]
 extern crate cocoa;
 #[cfg(target_os = "macos")]
@@ -32,10 +34,25 @@ use std::mem;
 use winit::{Event, WindowEvent};
 
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
-const FRAMES_IN_FLIGHT: usize = 5;
 
-struct Offset {
-    offset: [f32; 2],
+// we cannot know which image will be used before calling acquire_next_image,
+// for which we already need a semaphore ready for it to signal.
+
+// therefore, there is no direct link between SyncSets and swapchain images -
+// each time we draw a new frame, wait for the oldest sync_set to finish and use
+// that.
+struct SyncSet {
+    image_available_semaphore: vk::Semaphore,
+    render_finished_semaphore: vk::Semaphore,
+    render_finished_fence: vk::Fence,
+}
+
+// Command buffers "belong" to a specific swapchain image, because their render
+// pass specifies which framebuffer they render to.
+struct SwapchainImagePackage {
+    swapchain_image: vk::Image,
+    command_buffer: vk::CommandBuffer,
+    render_finished_fence: Option<vk::Fence>,
 }
 
 pub fn main() {
@@ -204,7 +221,7 @@ pub fn main() {
         p_next: ptr::null(),
         flags: vk::SwapchainCreateFlagsKHR::empty(),
         surface: surface,
-        min_image_count: 4,
+        min_image_count: 2,
         image_format: SWAPCHAIN_FORMAT,
         image_color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
         image_extent: starting_dims,
@@ -215,7 +232,7 @@ pub fn main() {
         p_queue_family_indices: ptr::null(),
         pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
         composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
-        present_mode: vk::PresentModeKHR::IMMEDIATE,
+        present_mode: vk::PresentModeKHR::FIFO,
         clipped: vk::TRUE,
         old_swapchain: vk::SwapchainKHR::null(),
     };
@@ -228,6 +245,8 @@ pub fn main() {
         .expect("Couldn't get swapchain images");
 
     println!("Swapchain image count: {}", images.len());
+    println!("Maximum frames in flight: {}", MAX_FRAMES_IN_FLIGHT);
+    let swapchain_image_count = images.len();
 
     let image_views: Vec<_> = images
         .iter()
@@ -262,8 +281,8 @@ pub fn main() {
     dbg![image_views.len()];
 
     // shaders
-    let frag_code = read_shader_code(&relative_path("shaders/uniform-no-vbuf/main.frag.spv"));
-    let vert_code = read_shader_code(&relative_path("shaders/uniform-no-vbuf/main.vert.spv"));
+    let frag_code = read_shader_code(&relative_path("shaders/vt-3/triangle.frag.spv"));
+    let vert_code = read_shader_code(&relative_path("shaders/vt-3/triangle.vert.spv"));
 
     let frag_module = create_shader_module(&device, frag_code);
     let vert_module = create_shader_module(&device, vert_code);
@@ -389,37 +408,13 @@ pub fn main() {
         blend_constants: [0.0, 0.0, 0.0, 0.0], // optional
     };
 
-    // uniform descriptors
-    let offset_binding = vk::DescriptorSetLayoutBinding {
-        binding: 0,
-        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-        descriptor_count: 1,
-        stage_flags: vk::ShaderStageFlags::VERTEX,
-        p_immutable_samplers: ptr::null(),
-    };
-
-    let bindings = [offset_binding];
-
-    let set_layout_info = vk::DescriptorSetLayoutCreateInfo {
-        s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::DescriptorSetLayoutCreateFlags::empty(),
-        binding_count: 1,
-        p_bindings: bindings.as_ptr(),
-    };
-
-    let set_layouts = [
-        unsafe { device.create_descriptor_set_layout(&set_layout_info, None) }
-            .expect("Couldn't create descriptor set layout"),
-    ];
-
     // we don't use any shader uniforms so we leave it empty
     let pipeline_layout_info = vk::PipelineLayoutCreateInfo {
         s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
         p_next: ptr::null(),
         flags: vk::PipelineLayoutCreateFlags::empty(),
-        set_layout_count: 1,
-        p_set_layouts: set_layouts.as_ptr(),
+        set_layout_count: 0,
+        p_set_layouts: ptr::null(),
         push_constant_range_count: 0,
         p_push_constant_ranges: ptr::null(),
     };
@@ -474,6 +469,7 @@ pub fn main() {
     let command_pool = create_command_pool(&device, queue_family_index);
 
     // command buffers (re-used between frames)
+    // each command buffer corresponds to a specific swapchain image
     let command_buffers = create_command_buffers(
         &device,
         render_pass,
@@ -483,19 +479,24 @@ pub fn main() {
         pipeline,
     );
 
-    // sync objects
-    let (
-        image_available_semaphores,
-        render_finished_semaphores,
-        in_flight_fences,
-        mut images_in_flight,
-    ) = create_sync_objects(&device, image_views.len());
+    // combine command buffers and swapchain images into SwapchainImagePackages,
+    // because command buffers can only be used with a specific swapchain images
+    let mut swapchain_image_packages: Vec<_> = (0..swapchain_image_count)
+        .map(|i| SwapchainImagePackage {
+            swapchain_image: images[i],
+            command_buffer: command_buffers[i],
+            // will be replaced with a fence representing the previous draw
+            // operation performed on this swapchain image once rendering begins
+            render_finished_fence: None,
+        })
+        .collect();
 
-    // will also be used to keep track of which set of synchronization
-    // primitives to use
+    // sync objects (do not correspond to swapchain images)
+    let sync_sets = create_sync_objects(&device);
+
+    // used to calculate FPS and keep track of which sync set to use next
+    // (remember, it's independent from which swapchain image is being used)
     let mut frames_drawn = 0;
-
-    // used to calculate FPS
     let start_time = std::time::Instant::now();
 
     loop {
@@ -513,44 +514,58 @@ pub fn main() {
             break;
         }
 
-        let cur_image_available_semaphore =
-            image_available_semaphores[frames_drawn % FRAMES_IN_FLIGHT];
-        let cur_render_finished_semaphore =
-            render_finished_semaphores[frames_drawn % FRAMES_IN_FLIGHT];
-        let cur_fence = in_flight_fences[frames_drawn % FRAMES_IN_FLIGHT];
+        let sync_set = &sync_sets[frames_drawn % MAX_FRAMES_IN_FLIGHT];
 
-        // wait for the fence associated with this command buffer
-        unsafe { device.wait_for_fences(&[cur_fence], true, std::u64::MAX) }
-            .expect("Couldn't wait for in_flight fence");
+        let image_available_semaphore = sync_set.image_available_semaphore;
+        let render_finished_semaphore = sync_set.render_finished_semaphore;
+        let render_finished_fence = sync_set.render_finished_fence;
 
+        // we can't use this sync set until whichever rendering was using it
+        // previously is finished, so wait for rendering to finished (use the
+        // fence because it's a GPU - CPU sync)
+        unsafe { device.wait_for_fences(&[render_finished_fence], true, std::u64::MAX) }
+            .expect("Couldn't wait for previous sync set to finish rendering");
+
+        // image_available_semaphore will be signalled once the swapchain image
+        // is actually available and not being displayed anymore -
+        // acquire_next_image will return the instant it knows which image index
+        // will be free next, so we need to wait on that semaphore
         let (image_idx, _is_sub_optimal) = unsafe {
             swapchain_creator.acquire_next_image(
                 swapchain,
                 std::u64::MAX,
-                cur_image_available_semaphore,
+                image_available_semaphore,
                 vk::Fence::null(),
             )
         }
         .expect("Couldn't acquire next image");
 
-        // make sure the image we just acquired is not in flight
-        if let Some(image_fence) = images_in_flight[image_idx as usize] {
+        let mut swapchain_image_package = &mut swapchain_image_packages[image_idx as usize];
+
+        // because we might have more sync sets than swapchain images, it's
+        // possible another set of sync sets is still rendering to this
+        // swapchain image. by waiting on the fence associated with this
+        // swapchain image, we can ensure it really is available
+        if let Some(image_fence) = swapchain_image_package.render_finished_fence {
             unsafe { device.wait_for_fences(&[image_fence], true, std::u64::MAX) }
                 .expect("Couldn't wait for image_in_flight fence");
         }
 
-        images_in_flight[image_idx as usize] = Some(cur_fence);
+        // set the render_finished_fence associated with this swapchain image to
+        // the fence that will be signalled when we finish rendering - in other
+        // words, "We're using this image! Don't touch it till we finish."
+        swapchain_image_package.render_finished_fence = Some(render_finished_fence);
 
         // submit command buffer
-        let wait_semaphores = [cur_image_available_semaphore];
+        let wait_semaphores = [image_available_semaphore];
 
         // "Each entry in the waitStages array corresponds to the semaphore with
         // the same index in pWaitSemaphores."
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
 
-        let cur_command_buffers = [command_buffers[image_idx as usize]];
+        let command_buffers = [swapchain_image_package.command_buffer];
 
-        let signal_semaphores = [cur_render_finished_semaphore];
+        let signal_semaphores = [render_finished_semaphore];
 
         let submit_info = vk::SubmitInfo {
             s_type: vk::StructureType::SUBMIT_INFO,
@@ -559,16 +574,19 @@ pub fn main() {
             p_wait_semaphores: wait_semaphores.as_ptr(),
             p_wait_dst_stage_mask: wait_stages.as_ptr(),
             command_buffer_count: 1,
-            p_command_buffers: cur_command_buffers.as_ptr(),
+            p_command_buffers: command_buffers.as_ptr(),
             signal_semaphore_count: 1,
             p_signal_semaphores: signal_semaphores.as_ptr(),
         };
 
-        // reset fence
-        unsafe { device.reset_fences(&[cur_fence]) }.expect("Couldn't reset in_flight fence");
+        // somebody else was previously using this fence and we waited until it
+        // was signalled (operation completed). now we need to reset it, because
+        // we aren't yet done but the fence says we are.
+        unsafe { device.reset_fences(&[render_finished_fence]) }
+            .expect("Couldn't reset render_finished_fence");
 
         let submissions = [submit_info];
-        unsafe { device.queue_submit(queue, &submissions, cur_fence) }
+        unsafe { device.queue_submit(queue, &submissions, render_finished_fence) }
             .expect("Couldn't submit command buffer");
 
         // present result to swapchain
@@ -608,17 +626,14 @@ pub fn main() {
         framebuffers
             .iter()
             .for_each(|fb| device.destroy_framebuffer(*fb, None));
-        image_available_semaphores
+        sync_sets
             .iter()
-            .for_each(|sem| device.destroy_semaphore(*sem, None));
-        render_finished_semaphores
-            .iter()
-            .for_each(|sem| device.destroy_semaphore(*sem, None));
-        in_flight_fences
-            .iter()
-            .for_each(|fence| device.destroy_fence(*fence, None));
+            .for_each(|set| {
+                device.destroy_semaphore(set.image_available_semaphore, None);
+                device.destroy_semaphore(set.render_finished_semaphore, None);
+                device.destroy_fence(set.render_finished_fence, None);
+            });
         device.destroy_command_pool(command_pool, None);
-        device.destroy_descriptor_set_layout(set_layouts[0], None);
         device.destroy_pipeline(pipeline, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
         swapchain_creator.destroy_swapchain(swapchain, None);
@@ -630,15 +645,7 @@ pub fn main() {
     }
 }
 
-fn create_sync_objects<D: DeviceV1_0>(
-    device: &D,
-    swapchain_image_count: usize,
-) -> (
-    Vec<vk::Semaphore>,
-    Vec<vk::Semaphore>,
-    Vec<vk::Fence>,
-    Vec<Option<vk::Fence>>,
-) {
+fn create_sync_objects<D: DeviceV1_0>(device: &D) -> Vec<SyncSet> {
     let semaphore_info = vk::SemaphoreCreateInfo {
         s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
         p_next: ptr::null(),
@@ -651,32 +658,16 @@ fn create_sync_objects<D: DeviceV1_0>(
         flags: vk::FenceCreateFlags::SIGNALED,
     };
 
-    let image_available_semaphores = (0..FRAMES_IN_FLIGHT)
-        .map(|_| {
-            unsafe { device.create_semaphore(&semaphore_info, None) }
-                .expect("Couldn't create semaphore")
+    (0..MAX_FRAMES_IN_FLIGHT)
+        .map(|_| SyncSet {
+            image_available_semaphore: unsafe { device.create_semaphore(&semaphore_info, None) }
+                .expect("Couldn't create semaphore"),
+            render_finished_semaphore: unsafe { device.create_semaphore(&semaphore_info, None) }
+                .expect("Couldn't create semaphore"),
+            render_finished_fence: unsafe { device.create_fence(&fence_info, None) }
+                .expect("Couldn't create fence"),
         })
-        .collect();
-
-    let render_finished_semaphores = (0..FRAMES_IN_FLIGHT)
-        .map(|_| {
-            unsafe { device.create_semaphore(&semaphore_info, None) }
-                .expect("Couldn't create semaphore")
-        })
-        .collect();
-
-    let in_flight_fences = (0..FRAMES_IN_FLIGHT)
-        .map(|_| unsafe { device.create_fence(&fence_info, None) }.expect("Couldn't create fence"))
-        .collect();
-
-    let images_in_flight = (0..swapchain_image_count).map(|_| None).collect();
-
-    (
-        image_available_semaphores,
-        render_finished_semaphores,
-        in_flight_fences,
-        images_in_flight,
-    )
+        .collect()
 }
 
 fn create_command_pool<D: DeviceV1_0>(device: &D, queue_family_index: u32) -> vk::CommandPool {

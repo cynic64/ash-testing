@@ -9,6 +9,10 @@ use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 
+use memoffset::offset_of;
+
+const MAX_FRAMES_IN_FLIGHT: usize = 4;
+
 #[cfg(target_os = "macos")]
 extern crate cocoa;
 #[cfg(target_os = "macos")]
@@ -16,6 +20,8 @@ extern crate metal;
 #[cfg(target_os = "macos")]
 extern crate objc;
 extern crate winit;
+#[cfg(target_os = "macos")]
+use ash::extensions::mvk::MacOSSurface;
 #[cfg(target_os = "macos")]
 use cocoa::appkit::{NSView, NSWindow};
 #[cfg(target_os = "macos")]
@@ -26,13 +32,38 @@ use metal::CoreAnimationLayer;
 use objc::runtime::YES;
 #[cfg(target_os = "macos")]
 use std::mem;
-#[cfg(target_os = "macos")]
-use ash::extensions::mvk::MacOSSurface;
 
 use winit::{Event, WindowEvent};
 
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
-const FRAMES_IN_FLIGHT: usize = 5;
+
+// we cannot know which image will be used before calling acquire_next_image,
+// for which we already need a semaphore ready for it to signal.
+
+// therefore, there is no direct link between SyncSets and swapchain images -
+// each time we draw a new frame, wait for the oldest sync_set to finish and use
+// that.
+struct SyncSet {
+    image_available_semaphore: vk::Semaphore,
+    render_finished_semaphore: vk::Semaphore,
+    render_finished_fence: vk::Fence,
+}
+
+// command buffers "belong" to a specific swapchain image, because their render
+// pass specifies which framebuffer they render to. The swapchain image itself
+// is not referenced in this struct because they are only ever referred to by
+// their indices.
+struct SwapchainImagePackage {
+    command_buffer: vk::CommandBuffer,
+    render_finished_fence: Option<vk::Fence>,
+}
+
+#[repr(C)]
+#[derive(Clone)]
+struct Vertex {
+    position: [f32; 2],
+    color: [f32; 3],
+}
 
 pub fn main() {
     // create winit window
@@ -188,78 +219,23 @@ pub fn main() {
     // get queue (0 = take first queue)
     let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
-    // check device swapchain capabilties (not just that it has the extension,
-    // also formats and stuff like that)
-    // also returns what dimensions the swapchain should initially be created at
-    let starting_dims = check_device_swapchain_caps(&surface_loader, physical_device, surface);
-    dbg![starting_dims];
-
-    // create swapchain
-    let swapchain_create_info = vk::SwapchainCreateInfoKHR {
-        s_type: vk::StructureType::SWAPCHAIN_CREATE_INFO_KHR,
-        p_next: ptr::null(),
-        flags: vk::SwapchainCreateFlagsKHR::empty(),
-        surface: surface,
-        min_image_count: 4,
-        image_format: SWAPCHAIN_FORMAT,
-        image_color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
-        image_extent: starting_dims,
-        image_array_layers: 1,
-        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
-        image_sharing_mode: vk::SharingMode::EXCLUSIVE,
-        queue_family_index_count: 0,
-        p_queue_family_indices: ptr::null(),
-        pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
-        composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
-        present_mode: vk::PresentModeKHR::IMMEDIATE,
-        clipped: vk::TRUE,
-        old_swapchain: vk::SwapchainKHR::null(),
-    };
-
     let swapchain_creator = Swapchain::new(&instance, &device);
-    let swapchain = unsafe { swapchain_creator.create_swapchain(&swapchain_create_info, None) }
-        .expect("Couldn't create swapchain");
 
-    let images = unsafe { swapchain_creator.get_swapchain_images(swapchain) }
-        .expect("Couldn't get swapchain images");
+    let (mut swapchain, mut swapchain_images, mut swapchain_dims) = create_swapchain(
+        physical_device,
+        &surface_loader,
+        surface,
+        &swapchain_creator,
+    );
 
-    println!("Swapchain image count: {}", images.len());
+    println!("Swapchain image count: {}", swapchain_images.len());
+    println!("Maximum frames in flight: {} ", MAX_FRAMES_IN_FLIGHT);
 
-    let image_views: Vec<_> = images
-        .iter()
-        .map(|image| {
-            let iv_info = vk::ImageViewCreateInfo {
-                s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
-                p_next: ptr::null(),
-                flags: vk::ImageViewCreateFlags::empty(),
-                image: *image,
-                view_type: vk::ImageViewType::TYPE_2D,
-                format: SWAPCHAIN_FORMAT,
-                components: vk::ComponentMapping {
-                    r: vk::ComponentSwizzle::IDENTITY,
-                    g: vk::ComponentSwizzle::IDENTITY,
-                    b: vk::ComponentSwizzle::IDENTITY,
-                    a: vk::ComponentSwizzle::IDENTITY,
-                },
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-            };
-
-            unsafe { device.create_image_view(&iv_info, None) }
-                .expect("Couldn't create image view info")
-        })
-        .collect();
-
-    dbg![image_views.len()];
+    let mut swapchain_image_views = create_swapchain_image_views(&device, &swapchain_images);
 
     // shaders
-    let frag_code = read_shader_code(&relative_path("shaders/vt-3/triangle.frag.spv"));
-    let vert_code = read_shader_code(&relative_path("shaders/vt-3/triangle.vert.spv"));
+    let frag_code = read_shader_code(&relative_path("shaders/vt-5-vbuf/triangle.frag.spv"));
+    let vert_code = read_shader_code(&relative_path("shaders/vt-5-vbuf/triangle.vert.spv"));
 
     let frag_module = create_shader_module(&device, frag_code);
     let vert_module = create_shader_module(&device, vert_code);
@@ -288,12 +264,517 @@ pub fn main() {
 
     let shader_stages = [vert_stage_info, frag_stage_info];
 
-    // fixed-function pipeline settings
+    // vbuf stuff
+    let vertex_data = vec![
+        Vertex {
+            position: [0.0, -1.0],
+            color: [1.0, 0.0, 0.0],
+        },
+        Vertex {
+            position: [-1.0, 1.0],
+            color: [0.0, 1.0, 0.0],
+        },
+        Vertex {
+            position: [1.0, 1.0],
+            color: [0.0, 0.0, 1.0],
+        },
+    ];
 
-    // a.k.a vertex format
-    // we don't really have a format since they are hard-coded into the vertex
-    // shader for now
-    let pipeline_vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+    let vertex_buffer_info = vk::BufferCreateInfo {
+        s_type: vk::StructureType::BUFFER_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::BufferCreateFlags::empty(),
+        size: std::mem::size_of_val(&vertex_data) as u64,
+        usage: vk::BufferUsageFlags::VERTEX_BUFFER,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+
+        // don't understand why this can be left blank
+        queue_family_index_count: 0,
+        p_queue_family_indices: ptr::null(),
+    };
+
+    let vertex_buffer = unsafe { device.create_buffer(&vertex_buffer_info, None) }
+        .expect("Couldn't create vertex buffer");
+
+    let binding_descriptions = Vertex::get_binding_descriptions();
+    let attribute_descriptions = Vertex::get_attribute_descriptions();
+
+    let vertex_buffer_memory_requirements =
+        unsafe { device.get_buffer_memory_requirements(vertex_buffer) };
+
+    let vertex_buffer_memory_type_index = find_memory_type(
+        &instance,
+        physical_device,
+        vertex_buffer_memory_requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    );
+
+    let vertex_buffer_alloc_info = vk::MemoryAllocateInfo {
+        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
+        p_next: ptr::null(),
+
+        // this size can be different from the size in vertex_buffer_info! I
+        // think the minimum allocation on the GPU is 256 bytes or something.
+        allocation_size: vertex_buffer_memory_requirements.size,
+        memory_type_index: vertex_buffer_memory_type_index,
+    };
+
+    let vertex_buffer_device_memory =
+        unsafe { device.allocate_memory(&vertex_buffer_alloc_info, None) }
+            .expect("Couldn't allocate vertex buffer device memory");
+
+    unsafe { device.bind_buffer_memory(vertex_buffer, vertex_buffer_device_memory, 0) }
+        .expect("Couldn't bind vertex buffer");
+
+    unsafe {
+        let mapped_memory = device
+            .map_memory(
+                vertex_buffer_device_memory,
+                0,
+                vertex_buffer_info.size,
+                vk::MemoryMapFlags::empty(),
+            )
+            .expect("Couldn't map vertex buffer memory") as *mut Vertex;
+
+        mapped_memory.copy_from_nonoverlapping(vertex_data.as_ptr(), vertex_data.len());
+
+        device.unmap_memory(vertex_buffer_device_memory);
+    }
+
+    // render pass
+    let render_pass = create_render_pass(&device);
+
+    // pipeline layout
+    let pipeline_layout = create_pipeline_layout(&device);
+
+    // pipeline
+    let mut pipeline = create_pipeline(
+        &device,
+        render_pass,
+        pipeline_layout,
+        swapchain_dims,
+        shader_stages,
+        &binding_descriptions,
+        &attribute_descriptions,
+    );
+
+    // framebuffer creation
+    let mut framebuffers =
+        create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
+
+    // command pool
+    let command_pool = create_command_pool(&device, queue_family_index);
+
+    // command buffers (re-used between frames)
+    // each command buffer corresponds to a specific swapchain image
+    let mut command_buffers = create_command_buffers(
+        &device,
+        render_pass,
+        command_pool,
+        swapchain_dims,
+        &framebuffers,
+        pipeline,
+        vertex_buffer,
+    );
+
+    // indices here correspond to swapchain image indices: if acquire_next_image
+    // returns an index of 2, we use the package (and command buffer) at 2.
+    let mut swapchain_image_packages =
+        create_swapchain_image_packages(swapchain_images.len(), &command_buffers);
+
+    // sync objects (do not correspond to swapchain images)
+    let sync_sets = create_sync_objects(&device);
+
+    // used to calculate FPS and keep track of which sync set to use next
+    // (remember, it's independent from which swapchain image is being used)
+    let mut frames_drawn = 0;
+    let start_time = std::time::Instant::now();
+
+    let mut must_recreate_swapchain = false;
+
+    loop {
+        if must_recreate_swapchain {
+            unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
+
+            // Cleanup_swapchain requires ownership of these to destroy
+            // them. They will be re-created later. Technically I think it
+            // would also work to pass pointers to cleanup_swapchain instead
+            // of transferring ownership, but I don't like the idea of that
+            // because then values in command_buffers and framebuffers would
+            // point to destroyed vulkan objects.
+            let our_framebuffers = std::mem::replace(&mut framebuffers, vec![]);
+            let our_command_buffers = std::mem::replace(&mut command_buffers, vec![]);
+            let our_swapchain_image_views = std::mem::replace(&mut swapchain_image_views, vec![]);
+
+            cleanup_swapchain(
+                &device,
+                &swapchain_creator,
+                our_framebuffers,
+                command_pool,
+                our_command_buffers,
+                pipeline,
+                our_swapchain_image_views,
+                swapchain,
+            );
+
+            // re-create swapchain
+            let ret = create_swapchain(
+                physical_device,
+                &surface_loader,
+                surface,
+                &swapchain_creator,
+            );
+
+            swapchain = ret.0;
+            swapchain_images = ret.1;
+            swapchain_dims = ret.2;
+
+            // re-create image views
+            swapchain_image_views = create_swapchain_image_views(&device, &swapchain_images);
+
+            // re-create graphics pipeline
+            pipeline = create_pipeline(
+                &device,
+                render_pass,
+                pipeline_layout,
+                swapchain_dims,
+                shader_stages,
+                &binding_descriptions,
+                &attribute_descriptions,
+            );
+
+            // re-create framebuffers
+            // framebuffer creation
+            framebuffers =
+                create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
+
+            // re-create command buffers
+            command_buffers = create_command_buffers(
+                &device,
+                render_pass,
+                command_pool,
+                swapchain_dims,
+                &framebuffers,
+                pipeline,
+                vertex_buffer,
+            );
+
+            swapchain_image_packages =
+                create_swapchain_image_packages(swapchain_images.len(), &command_buffers);
+
+            // frames_drawn = 0;
+
+            must_recreate_swapchain = false;
+        }
+
+        let mut exit = false;
+
+        events_loop.poll_events(|ev| match ev {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => exit = true,
+            _ => {}
+        });
+
+        if exit {
+            break;
+        }
+
+        let sync_set = &sync_sets[frames_drawn % MAX_FRAMES_IN_FLIGHT];
+
+        let image_available_semaphore = sync_set.image_available_semaphore;
+        let render_finished_semaphore = sync_set.render_finished_semaphore;
+        let render_finished_fence = sync_set.render_finished_fence;
+
+        // we can't use this sync set until whichever rendering was using it
+        // previously is finished, so wait for rendering to finished (use the
+        // fence because it's a GPU - CPU sync)
+        unsafe { device.wait_for_fences(&[render_finished_fence], true, std::u64::MAX) }
+            .expect("Couldn't wait for previous sync set to finish rendering");
+
+        // image_available_semaphore will be signalled once the swapchain image
+        // is actually available and not being displayed anymore -
+        // acquire_next_image will return the instant it knows which image index
+        // will be free next, so we need to wait on that semaphore
+        let acquire_result = unsafe {
+            swapchain_creator.acquire_next_image(
+                swapchain,
+                std::u64::MAX,
+                image_available_semaphore,
+                vk::Fence::null(),
+            )
+        };
+
+        let image_idx = match acquire_result {
+            Ok((image_idx, _is_sub_optimal)) => image_idx,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                must_recreate_swapchain = true;
+                continue;
+            }
+            Err(e) => panic!("Unexpected error during acquire_next_image: {}", e),
+        };
+
+        let mut swapchain_image_package = &mut swapchain_image_packages[image_idx as usize];
+
+        // because we might have more sync sets than swapchain images, it's
+        // possible another set of sync sets is still rendering to this
+        // swapchain image. by waiting on the fence associated with this
+        // swapchain image, we can ensure it really is available
+        if let Some(image_fence) = swapchain_image_package.render_finished_fence {
+            unsafe { device.wait_for_fences(&[image_fence], true, std::u64::MAX) }
+                .expect("Couldn't wait for image_in_flight fence");
+        }
+
+        // set the render_finished_fence associated with this swapchain image to
+        // the fence that will be signalled when we finish rendering - in other
+        // words, "We're using this image! Don't touch it till we finish."
+        swapchain_image_package.render_finished_fence = Some(render_finished_fence);
+
+        // submit command buffer
+        let wait_semaphores = [image_available_semaphore];
+
+        // "Each entry in the waitStages array corresponds to the semaphore with
+        // the same index in pWaitSemaphores."
+        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+
+        let cur_command_buffers = [swapchain_image_package.command_buffer];
+
+        let signal_semaphores = [render_finished_semaphore];
+
+        let submit_info = vk::SubmitInfo {
+            s_type: vk::StructureType::SUBMIT_INFO,
+            p_next: ptr::null(),
+            wait_semaphore_count: 1,
+            p_wait_semaphores: wait_semaphores.as_ptr(),
+            p_wait_dst_stage_mask: wait_stages.as_ptr(),
+            command_buffer_count: 1,
+            p_command_buffers: cur_command_buffers.as_ptr(),
+            signal_semaphore_count: 1,
+            p_signal_semaphores: signal_semaphores.as_ptr(),
+        };
+
+        // somebody else was previously using this fence and we waited until it
+        // was signalled (operation completed). now we need to reset it, because
+        // we aren't yet done but the fence says we are.
+        unsafe { device.reset_fences(&[render_finished_fence]) }
+            .expect("Couldn't reset render_finished_fence");
+
+        let submissions = [submit_info];
+        unsafe { device.queue_submit(queue, &submissions, render_finished_fence) }
+            .expect("Couldn't submit command buffer");
+
+        // present result to swapchain
+        let swapchains = [swapchain];
+        let image_indices = [image_idx];
+
+        let present_info = vk::PresentInfoKHR {
+            s_type: vk::StructureType::PRESENT_INFO_KHR,
+            p_next: ptr::null(),
+            wait_semaphore_count: 1,
+            p_wait_semaphores: signal_semaphores.as_ptr(),
+            swapchain_count: 1,
+            p_swapchains: swapchains.as_ptr(),
+            p_image_indices: image_indices.as_ptr(),
+            p_results: ptr::null_mut(),
+        };
+
+        match unsafe { swapchain_creator.queue_present(queue, &present_info) } {
+            Ok(_idk_what_this_is) => (),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                must_recreate_swapchain = true;
+                continue;
+            }
+            Err(e) => panic!("Unexpected error during queue_present: {}", e),
+        };
+
+        frames_drawn += 1;
+    }
+
+    println!("FPS: {:.2}", frames_drawn as f64 / get_elapsed(start_time));
+    println!(
+        "Average delta in ms: {:.5}",
+        get_elapsed(start_time) / frames_drawn as f64 * 1_000.0
+    );
+
+    unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
+
+    // destroy objects
+    unsafe {
+        device.destroy_buffer(vertex_buffer, None);
+        device.free_memory(vertex_buffer_device_memory, None);
+        device.destroy_shader_module(frag_module, None);
+        device.destroy_shader_module(vert_module, None);
+        cleanup_swapchain(
+            &device,
+            &swapchain_creator,
+            framebuffers,
+            command_pool,
+            command_buffers,
+            pipeline,
+            swapchain_image_views,
+            swapchain,
+        );
+        device.destroy_pipeline_layout(pipeline_layout, None);
+        device.destroy_render_pass(render_pass, None);
+        sync_sets.iter().for_each(|set| {
+            device.destroy_semaphore(set.image_available_semaphore, None);
+            device.destroy_semaphore(set.render_finished_semaphore, None);
+            device.destroy_fence(set.render_finished_fence, None);
+        });
+        device.destroy_command_pool(command_pool, None);
+        device.destroy_device(None);
+        surface_loader.destroy_surface(surface, None);
+        debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
+        instance.destroy_instance(None);
+    }
+}
+
+// taken from vulkan-tutorial-rust
+fn find_memory_type<I: InstanceV1_0>(
+    instance: &I,
+    physical_device: vk::PhysicalDevice,
+    type_filter: u32,
+    required_properties: vk::MemoryPropertyFlags,
+) -> u32 {
+    let mem_properties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+
+    for (i, memory_type) in mem_properties.memory_types.iter().enumerate() {
+        // this is magic, accept it
+        if (type_filter & (1 << i)) > 0 && memory_type.property_flags.contains(required_properties)
+        {
+            return i as u32;
+        }
+    }
+
+    panic!("Failed to find suitable memory type!")
+}
+
+impl Vertex {
+    fn get_binding_descriptions() -> [vk::VertexInputBindingDescription; 1] {
+        [vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: std::mem::size_of::<Self>() as u32,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }]
+    }
+
+    fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+        [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: offset_of!(Self, position) as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: offset_of!(Self, color) as u32,
+            },
+        ]
+    }
+}
+
+fn create_swapchain(
+    physical_device: vk::PhysicalDevice,
+    surface_loader: &Surface,
+    surface: vk::SurfaceKHR,
+    swapchain_creator: &Swapchain,
+) -> (vk::SwapchainKHR, Vec<vk::Image>, vk::Extent2D) {
+    // check device swapchain capabilties (not just that it has the extension,
+    // also formats and stuff like that)
+    // also returns what dimensions the swapchain should initially be created at
+    let dimensions = check_device_swapchain_caps(surface_loader, physical_device, surface);
+
+    // for now, the format is fixed - might be good to change later.
+
+    // create swapchain
+    let create_info = vk::SwapchainCreateInfoKHR {
+        s_type: vk::StructureType::SWAPCHAIN_CREATE_INFO_KHR,
+        p_next: ptr::null(),
+        flags: vk::SwapchainCreateFlagsKHR::empty(),
+        surface: surface,
+        min_image_count: 2,
+        image_format: SWAPCHAIN_FORMAT,
+        image_color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+        image_extent: dimensions,
+        image_array_layers: 1,
+        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        image_sharing_mode: vk::SharingMode::EXCLUSIVE,
+        queue_family_index_count: 0,
+        p_queue_family_indices: ptr::null(),
+        pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
+        composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
+        present_mode: vk::PresentModeKHR::IMMEDIATE,
+        clipped: vk::TRUE,
+        old_swapchain: vk::SwapchainKHR::null(),
+    };
+
+    let swapchain = unsafe { swapchain_creator.create_swapchain(&create_info, None) }
+        .expect("Couldn't create swapchain");
+
+    let images = unsafe { swapchain_creator.get_swapchain_images(swapchain) }
+        .expect("Couldn't get swapchain images");
+
+    (swapchain, images, dimensions)
+}
+
+fn create_swapchain_image_views<D: DeviceV1_0>(
+    device: &D,
+    images: &[vk::Image],
+) -> Vec<vk::ImageView> {
+    images
+        .iter()
+        .map(|image| {
+            let iv_info = vk::ImageViewCreateInfo {
+                s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+                p_next: ptr::null(),
+                flags: vk::ImageViewCreateFlags::empty(),
+                image: *image,
+                view_type: vk::ImageViewType::TYPE_2D,
+                format: SWAPCHAIN_FORMAT,
+                components: vk::ComponentMapping {
+                    r: vk::ComponentSwizzle::IDENTITY,
+                    g: vk::ComponentSwizzle::IDENTITY,
+                    b: vk::ComponentSwizzle::IDENTITY,
+                    a: vk::ComponentSwizzle::IDENTITY,
+                },
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+            };
+
+            unsafe { device.create_image_view(&iv_info, None) }
+                .expect("Couldn't create image view info")
+        })
+        .collect()
+}
+
+fn create_pipeline<D: DeviceV1_0>(
+    device: &D,
+    render_pass: vk::RenderPass,
+    pipeline_layout: vk::PipelineLayout,
+    swapchain_dims: vk::Extent2D,
+    shader_stages: [vk::PipelineShaderStageCreateInfo; 2],
+    binding_descriptions: &[vk::VertexInputBindingDescription],
+    attribute_descriptions: &[vk::VertexInputAttributeDescription],
+) -> vk::Pipeline {
+    // vertex format
+    let pipeline_vertex_input_info = vk::PipelineVertexInputStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineVertexInputStateCreateFlags::empty(),
+        vertex_binding_description_count: binding_descriptions.len() as u32,
+        p_vertex_binding_descriptions: binding_descriptions.as_ptr(),
+        vertex_attribute_description_count: attribute_descriptions.len() as u32,
+        p_vertex_attribute_descriptions: attribute_descriptions.as_ptr(),
+    };
 
     let pipeline_input_assembly_info = vk::PipelineInputAssemblyStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -306,15 +787,15 @@ pub fn main() {
     let viewports = [vk::Viewport {
         x: 0.0,
         y: 0.0,
-        width: starting_dims.width as f32,
-        height: starting_dims.height as f32,
+        width: swapchain_dims.width as f32,
+        height: swapchain_dims.height as f32,
         min_depth: 0.0,
         max_depth: 1.0,
     }];
 
     let scissors = [vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
-        extent: starting_dims,
+        extent: swapchain_dims,
     }];
 
     let viewport_state = vk::PipelineViewportStateCreateInfo {
@@ -369,8 +850,8 @@ pub fn main() {
         // is used
         color_write_mask: vk::ColorComponentFlags::R
             | vk::ColorComponentFlags::G
-            | vk::ColorComponentFlags::G
-            | vk::ColorComponentFlags::B,
+            | vk::ColorComponentFlags::B
+            | vk::ColorComponentFlags::A,
     }];
 
     // color blending settings for the whole pipleine
@@ -385,27 +866,6 @@ pub fn main() {
         blend_constants: [0.0, 0.0, 0.0, 0.0], // optional
     };
 
-    // we don't use any shader uniforms so we leave it empty
-    let pipeline_layout_info = vk::PipelineLayoutCreateInfo {
-        s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::PipelineLayoutCreateFlags::empty(),
-        set_layout_count: 0,
-        p_set_layouts: ptr::null(),
-        push_constant_range_count: 0,
-        p_push_constant_ranges: ptr::null(),
-    };
-
-    let pipeline_layout = unsafe {
-        device
-            .create_pipeline_layout(&pipeline_layout_info, None)
-            .expect("Couldn't create pipeline layout!")
-    };
-
-    // render pass
-    let render_pass = create_render_pass(&device);
-
-    // pipeline
     let pipeline_infos = [vk::GraphicsPipelineCreateInfo {
         s_type: vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO,
         p_next: ptr::null(),
@@ -428,185 +888,69 @@ pub fn main() {
         base_pipeline_index: 0,
     }];
 
-    let pipeline = unsafe {
-        device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_infos, None)
-    }
-    .expect("Couldn't create graphics pipeline")[0];
+    unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_infos, None) }
+        .expect("Couldn't create graphics pipeline")[0]
+}
 
-    // shader modules only need to live long enough to create the pipeline
+fn create_pipeline_layout<D: DeviceV1_0>(device: &D) -> vk::PipelineLayout {
+    // fixed-function pipeline settings
+
+    // we don't use any shader uniforms so we leave it empty
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo {
+        s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineLayoutCreateFlags::empty(),
+        set_layout_count: 0,
+        p_set_layouts: ptr::null(),
+        push_constant_range_count: 0,
+        p_push_constant_ranges: ptr::null(),
+    };
+
     unsafe {
-        device.destroy_shader_module(frag_module, None);
-        device.destroy_shader_module(vert_module, None);
+        device
+            .create_pipeline_layout(&pipeline_layout_info, None)
+            .expect("Couldn't create pipeline layout!")
     }
+}
 
-    // framebuffer creation
-    let framebuffers = create_framebuffers(&device, render_pass, starting_dims, &image_views);
+fn create_swapchain_image_packages(
+    swapchain_image_count: usize,
+    command_buffers: &[vk::CommandBuffer],
+) -> Vec<SwapchainImagePackage> {
+    (0..swapchain_image_count)
+        .map(|i| SwapchainImagePackage {
+            command_buffer: command_buffers[i],
+            // will be replaced with a fence representing the previous draw
+            // operation performed on this swapchain image once rendering begins
+            render_finished_fence: None,
+        })
+        .collect()
+}
 
-    // command pool
-    let command_pool = create_command_pool(&device, queue_family_index);
-
-    // command buffers (re-used between frames)
-    let command_buffers = create_command_buffers(
-        &device,
-        render_pass,
-        command_pool,
-        starting_dims,
-        &framebuffers,
-        pipeline,
-    );
-
-    // sync objects
-    let (
-        image_available_semaphores,
-        render_finished_semaphores,
-        in_flight_fences,
-        mut images_in_flight,
-    ) = create_sync_objects(&device, image_views.len());
-
-    // will also be used to keep track of which set of synchronization
-    // primitives to use
-    let mut frames_drawn = 0;
-
-    // used to calculate FPS
-    let start_time = std::time::Instant::now();
-
-    loop {
-        let mut exit = false;
-
-        events_loop.poll_events(|ev| match ev {
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => exit = true,
-            _ => {}
-        });
-
-        if exit {
-            break;
-        }
-
-        let cur_image_available_semaphore =
-            image_available_semaphores[frames_drawn % FRAMES_IN_FLIGHT];
-        let cur_render_finished_semaphore =
-            render_finished_semaphores[frames_drawn % FRAMES_IN_FLIGHT];
-        let cur_fence = in_flight_fences[frames_drawn % FRAMES_IN_FLIGHT];
-
-        // wait for the fence associated with this command buffer
-        unsafe { device.wait_for_fences(&[cur_fence], true, std::u64::MAX) }
-            .expect("Couldn't wait for in_flight fence");
-
-        let (image_idx, _is_sub_optimal) = unsafe {
-            swapchain_creator.acquire_next_image(
-                swapchain,
-                std::u64::MAX,
-                cur_image_available_semaphore,
-                vk::Fence::null(),
-            )
-        }
-        .expect("Couldn't acquire next image");
-
-        // make sure the image we just acquired is not in flight
-        if let Some(image_fence) = images_in_flight[image_idx as usize] {
-            unsafe { device.wait_for_fences(&[image_fence], true, std::u64::MAX) }
-                .expect("Couldn't wait for image_in_flight fence");
-        }
-
-        images_in_flight[image_idx as usize] = Some(cur_fence);
-
-        // submit command buffer
-        let wait_semaphores = [cur_image_available_semaphore];
-
-        // "Each entry in the waitStages array corresponds to the semaphore with
-        // the same index in pWaitSemaphores."
-        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-
-        let cur_command_buffers = [command_buffers[image_idx as usize]];
-
-        let signal_semaphores = [cur_render_finished_semaphore];
-
-        let submit_info = vk::SubmitInfo {
-            s_type: vk::StructureType::SUBMIT_INFO,
-            p_next: ptr::null(),
-            wait_semaphore_count: 1,
-            p_wait_semaphores: wait_semaphores.as_ptr(),
-            p_wait_dst_stage_mask: wait_stages.as_ptr(),
-            command_buffer_count: 1,
-            p_command_buffers: cur_command_buffers.as_ptr(),
-            signal_semaphore_count: 1,
-            p_signal_semaphores: signal_semaphores.as_ptr(),
-        };
-
-        // reset fence
-        unsafe { device.reset_fences(&[cur_fence]) }.expect("Couldn't reset in_flight fence");
-
-        let submissions = [submit_info];
-        unsafe { device.queue_submit(queue, &submissions, cur_fence) }
-            .expect("Couldn't submit command buffer");
-
-        // present result to swapchain
-        let swapchains = [swapchain];
-        let image_indices = [image_idx];
-
-        let present_info = vk::PresentInfoKHR {
-            s_type: vk::StructureType::PRESENT_INFO_KHR,
-            p_next: ptr::null(),
-            wait_semaphore_count: 1,
-            p_wait_semaphores: signal_semaphores.as_ptr(),
-            swapchain_count: 1,
-            p_swapchains: swapchains.as_ptr(),
-            p_image_indices: image_indices.as_ptr(),
-            p_results: ptr::null_mut(),
-        };
-
-        unsafe { swapchain_creator.queue_present(queue, &present_info) }
-            .expect("Couldn't present swapchain result");
-
-        frames_drawn += 1;
-    }
-
-    println!("FPS: {:.2}", frames_drawn as f64 / get_elapsed(start_time));
-    println!("Average delta in ms: {:.5}", get_elapsed(start_time) / frames_drawn as f64 * 1_000.0);
-
-    unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
-
-    // destroy objects
+fn cleanup_swapchain<D: DeviceV1_0>(
+    device: &D,
+    swapchain_creator: &Swapchain,
+    framebuffers: Vec<vk::Framebuffer>,
+    command_pool: vk::CommandPool,
+    command_buffers: Vec<vk::CommandBuffer>,
+    pipeline: vk::Pipeline,
+    swapchain_image_views: Vec<vk::ImageView>,
+    swapchain: vk::SwapchainKHR,
+) {
     unsafe {
-        image_views
+        device.free_command_buffers(command_pool, &command_buffers);
+        swapchain_image_views
             .iter()
             .for_each(|iv| device.destroy_image_view(*iv, None));
         framebuffers
             .iter()
             .for_each(|fb| device.destroy_framebuffer(*fb, None));
-        image_available_semaphores
-            .iter()
-            .for_each(|sem| device.destroy_semaphore(*sem, None));
-        render_finished_semaphores
-            .iter()
-            .for_each(|sem| device.destroy_semaphore(*sem, None));
-        in_flight_fences
-            .iter()
-            .for_each(|fence| device.destroy_fence(*fence, None));
-        device.destroy_command_pool(command_pool, None);
         device.destroy_pipeline(pipeline, None);
-        device.destroy_pipeline_layout(pipeline_layout, None);
         swapchain_creator.destroy_swapchain(swapchain, None);
-        device.destroy_render_pass(render_pass, None);
-        device.destroy_device(None);
-        surface_loader.destroy_surface(surface, None);
-        debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
-        instance.destroy_instance(None);
     }
 }
 
-fn create_sync_objects<D: DeviceV1_0>(
-    device: &D,
-    swapchain_image_count: usize,
-) -> (
-    Vec<vk::Semaphore>,
-    Vec<vk::Semaphore>,
-    Vec<vk::Fence>,
-    Vec<Option<vk::Fence>>,
-) {
+fn create_sync_objects<D: DeviceV1_0>(device: &D) -> Vec<SyncSet> {
     let semaphore_info = vk::SemaphoreCreateInfo {
         s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
         p_next: ptr::null(),
@@ -619,32 +963,16 @@ fn create_sync_objects<D: DeviceV1_0>(
         flags: vk::FenceCreateFlags::SIGNALED,
     };
 
-    let image_available_semaphores = (0..FRAMES_IN_FLIGHT)
-        .map(|_| {
-            unsafe { device.create_semaphore(&semaphore_info, None) }
-                .expect("Couldn't create semaphore")
+    (0..MAX_FRAMES_IN_FLIGHT)
+        .map(|_| SyncSet {
+            image_available_semaphore: unsafe { device.create_semaphore(&semaphore_info, None) }
+                .expect("Couldn't create semaphore"),
+            render_finished_semaphore: unsafe { device.create_semaphore(&semaphore_info, None) }
+                .expect("Couldn't create semaphore"),
+            render_finished_fence: unsafe { device.create_fence(&fence_info, None) }
+                .expect("Couldn't create fence"),
         })
-        .collect();
-
-    let render_finished_semaphores = (0..FRAMES_IN_FLIGHT)
-        .map(|_| {
-            unsafe { device.create_semaphore(&semaphore_info, None) }
-                .expect("Couldn't create semaphore")
-        })
-        .collect();
-
-    let in_flight_fences = (0..FRAMES_IN_FLIGHT)
-        .map(|_| unsafe { device.create_fence(&fence_info, None) }.expect("Couldn't create fence"))
-        .collect();
-
-    let images_in_flight = (0..swapchain_image_count).map(|_| None).collect();
-
-    (
-        image_available_semaphores,
-        render_finished_semaphores,
-        in_flight_fences,
-        images_in_flight,
-    )
+        .collect()
 }
 
 fn create_command_pool<D: DeviceV1_0>(device: &D, queue_family_index: u32) -> vk::CommandPool {
@@ -666,6 +994,7 @@ fn create_command_buffers<D: DeviceV1_0>(
     dimensions: vk::Extent2D,
     framebuffers: &[vk::Framebuffer],
     pipeline: vk::Pipeline,
+    vertex_buffer: vk::Buffer,
 ) -> Vec<vk::CommandBuffer> {
     let command_buffer_alloc_info = vk::CommandBufferAllocateInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
@@ -723,6 +1052,10 @@ fn create_command_buffers<D: DeviceV1_0>(
                 );
 
                 device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+
+                let vertex_buffers = [vertex_buffer];
+                let offsets: [vk::DeviceSize; 1] = [0];
+                device.cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
 
                 // 3 vertices, 1 instance, first vertex 0, first instance 0
                 device.cmd_draw(command_buffer, 3, 1, 0, 0);
@@ -892,29 +1225,7 @@ fn check_device_swapchain_caps(
 
 // many of these functions are ripped from https://github.com/bwasty/vulkan-tutorial-rs
 
-// only works on linux
-/*
-unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
-    entry: &E,
-    instance: &I,
-    window: &winit::Window,
-) -> Result<vk::SurfaceKHR, vk::Result> {
-    use winit::os::unix::WindowExt;
-
-    let x11_display = window.get_xlib_display().unwrap();
-    let x11_window = window.get_xlib_window().unwrap();
-    let x11_create_info = vk::XlibSurfaceCreateInfoKHR {
-        s_type: vk::StructureType::XLIB_SURFACE_CREATE_INFO_KHR,
-        p_next: ptr::null(),
-        flags: Default::default(),
-        window: x11_window as vk::Window,
-        dpy: x11_display as *mut vk::Display,
-    };
-    let xlib_surface_loader = XlibSurface::new(entry, instance);
-    xlib_surface_loader.create_xlib_surface(&x11_create_info, None)
-}
-*/
-
+// this is ripped from the ash examples
 #[cfg(all(unix, not(target_os = "android"), not(target_os = "macos")))]
 unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     entry: &E,
@@ -989,7 +1300,6 @@ unsafe fn create_surface<E: EntryV1_0, I: InstanceV1_0>(
     let win32_surface_loader = Win32Surface::new(entry, instance);
     win32_surface_loader.create_win32_surface(&win32_create_info, None)
 }
-
 
 fn create_render_pass(device: &ash::Device) -> vk::RenderPass {
     // our render pass has a single image, so only one attachment description is
