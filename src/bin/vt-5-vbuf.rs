@@ -47,15 +47,7 @@ struct SyncSet {
     image_available_semaphore: vk::Semaphore,
     render_finished_semaphore: vk::Semaphore,
     render_finished_fence: vk::Fence,
-}
-
-// command buffers "belong" to a specific swapchain image, because their render
-// pass specifies which framebuffer they render to. The swapchain image itself
-// is not referenced in this struct because they are only ever referred to by
-// their indices.
-struct SwapchainImagePackage {
-    command_buffer: vk::CommandBuffer,
-    render_finished_fence: Option<vk::Fence>,
+    command_buffer: Option<vk::CommandBuffer>,
 }
 
 #[repr(C)]
@@ -365,25 +357,12 @@ pub fn main() {
     // command pool
     let command_pool = create_command_pool(&device, queue_family_index);
 
-    // command buffers (re-used between frames)
-    // each command buffer corresponds to a specific swapchain image
-    let mut command_buffers = create_command_buffers(
-        &device,
-        render_pass,
-        command_pool,
-        swapchain_dims,
-        &framebuffers,
-        pipeline,
-        vertex_buffer,
-    );
+    // sync objects (one for each swapchain image)
+    let mut sync_sets = create_sync_objects(&device);
 
-    // indices here correspond to swapchain image indices: if acquire_next_image
-    // returns an index of 2, we use the package (and command buffer) at 2.
-    let mut swapchain_image_packages =
-        create_swapchain_image_packages(swapchain_images.len(), &command_buffers);
-
-    // sync objects (do not correspond to swapchain images)
-    let sync_sets = create_sync_objects(&device);
+    // used to check whether rendering to a swapchain image has finished,
+    // necessary because we have more sync sets than swapchain images
+    let mut swapchain_fences: Vec<Option<vk::Fence>> = vec![None; swapchain_images.len()];
 
     // used to calculate FPS and keep track of which sync set to use next
     // (remember, it's independent from which swapchain image is being used)
@@ -403,15 +382,12 @@ pub fn main() {
             // because then values in command_buffers and framebuffers would
             // point to destroyed vulkan objects.
             let our_framebuffers = std::mem::replace(&mut framebuffers, vec![]);
-            let our_command_buffers = std::mem::replace(&mut command_buffers, vec![]);
             let our_swapchain_image_views = std::mem::replace(&mut swapchain_image_views, vec![]);
 
             cleanup_swapchain(
                 &device,
                 &swapchain_creator,
                 our_framebuffers,
-                command_pool,
-                our_command_buffers,
                 pipeline,
                 our_swapchain_image_views,
                 swapchain,
@@ -448,20 +424,6 @@ pub fn main() {
             framebuffers =
                 create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
 
-            // re-create command buffers
-            command_buffers = create_command_buffers(
-                &device,
-                render_pass,
-                command_pool,
-                swapchain_dims,
-                &framebuffers,
-                pipeline,
-                vertex_buffer,
-            );
-
-            swapchain_image_packages =
-                create_swapchain_image_packages(swapchain_images.len(), &command_buffers);
-
             must_recreate_swapchain = false;
         }
 
@@ -491,6 +453,17 @@ pub fn main() {
         unsafe { device.wait_for_fences(&[render_finished_fence], true, std::u64::MAX) }
             .expect("Couldn't wait for previous sync set to finish rendering");
 
+        // since rendering has finished, we can free that command buffer
+        if let Some(command_buffer) = sync_set.command_buffer {
+            unsafe { device.free_command_buffers(command_pool, &[command_buffer]) };
+        } else {
+            // should only happen when swapchain images are first used, panic
+            // otherwise
+            if frames_drawn >= MAX_FRAMES_IN_FLIGHT {
+                panic!("No command buffer in sync set on frame {}", frames_drawn);
+            }
+        }
+
         // image_available_semaphore will be signalled once the swapchain image
         // is actually available and not being displayed anymore -
         // acquire_next_image will return the instant it knows which image index
@@ -513,21 +486,44 @@ pub fn main() {
             Err(e) => panic!("Unexpected error during acquire_next_image: {}", e),
         };
 
-        let mut swapchain_image_package = &mut swapchain_image_packages[image_idx as usize];
-
         // because we might have more sync sets than swapchain images, it's
         // possible another set of sync sets is still rendering to this
         // swapchain image. by waiting on the fence associated with this
         // swapchain image, we can ensure it really is available
-        if let Some(image_fence) = swapchain_image_package.render_finished_fence {
+        if let Some(image_fence) = swapchain_fences[image_idx as usize] {
             unsafe { device.wait_for_fences(&[image_fence], true, std::u64::MAX) }
                 .expect("Couldn't wait for image_in_flight fence");
+        } else {
+            // this should only happen on the first MAX_FRAMES_IN_FLIGHT frames
+            // drawn, because at that point we will not yet have started using
+            // all sync sets
+
+            // if it happens afterwards, panic
+            if frames_drawn >= MAX_FRAMES_IN_FLIGHT {
+                panic!(
+                    "No fence for this swapchain image at frame {}! image_idx: {}",
+                    frames_drawn, image_idx
+                );
+            }
         }
 
         // set the render_finished_fence associated with this swapchain image to
         // the fence that will be signalled when we finish rendering - in other
         // words, "We're using this image! Don't touch it till we finish."
-        swapchain_image_package.render_finished_fence = Some(render_finished_fence);
+        swapchain_fences[image_idx as usize] = Some(render_finished_fence);
+
+        // create command buffer
+        let command_buffer = create_command_buffer(
+            &device,
+            render_pass,
+            pipeline,
+            command_pool,
+            framebuffers[image_idx as usize],
+            swapchain_dims,
+            vertex_buffer,
+        );
+
+        sync_sets[frames_drawn % MAX_FRAMES_IN_FLIGHT].command_buffer = Some(command_buffer);
 
         // submit command buffer
         let wait_semaphores = [image_available_semaphore];
@@ -536,7 +532,7 @@ pub fn main() {
         // the same index in pWaitSemaphores."
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
 
-        let cur_command_buffers = [swapchain_image_package.command_buffer];
+        let cur_command_buffers = [command_buffer];
 
         let signal_semaphores = [render_finished_semaphore];
 
@@ -601,14 +597,17 @@ pub fn main() {
     unsafe {
         device.destroy_buffer(vertex_buffer, None);
         device.free_memory(vertex_buffer_device_memory, None);
+        sync_sets.iter().for_each(|ss| {
+            if let Some(command_buffer) = ss.command_buffer {
+                device.free_command_buffers(command_pool, &[command_buffer]);
+            }
+        });
         device.destroy_shader_module(frag_module, None);
         device.destroy_shader_module(vert_module, None);
         cleanup_swapchain(
             &device,
             &swapchain_creator,
             framebuffers,
-            command_pool,
-            command_buffers,
             pipeline,
             swapchain_image_views,
             swapchain,
@@ -911,32 +910,15 @@ fn create_pipeline_layout<D: DeviceV1_0>(device: &D) -> vk::PipelineLayout {
     }
 }
 
-fn create_swapchain_image_packages(
-    swapchain_image_count: usize,
-    command_buffers: &[vk::CommandBuffer],
-) -> Vec<SwapchainImagePackage> {
-    (0..swapchain_image_count)
-        .map(|i| SwapchainImagePackage {
-            command_buffer: command_buffers[i],
-            // will be replaced with a fence representing the previous draw
-            // operation performed on this swapchain image once rendering begins
-            render_finished_fence: None,
-        })
-        .collect()
-}
-
 fn cleanup_swapchain<D: DeviceV1_0>(
     device: &D,
     swapchain_creator: &Swapchain,
     framebuffers: Vec<vk::Framebuffer>,
-    command_pool: vk::CommandPool,
-    command_buffers: Vec<vk::CommandBuffer>,
     pipeline: vk::Pipeline,
     swapchain_image_views: Vec<vk::ImageView>,
     swapchain: vk::SwapchainKHR,
 ) {
     unsafe {
-        device.free_command_buffers(command_pool, &command_buffers);
         swapchain_image_views
             .iter()
             .for_each(|iv| device.destroy_image_view(*iv, None));
@@ -969,6 +951,7 @@ fn create_sync_objects<D: DeviceV1_0>(device: &D) -> Vec<SyncSet> {
                 .expect("Couldn't create semaphore"),
             render_finished_fence: unsafe { device.create_fence(&fence_info, None) }
                 .expect("Couldn't create fence"),
+            command_buffer: None,
         })
         .collect()
 }
@@ -985,15 +968,15 @@ fn create_command_pool<D: DeviceV1_0>(device: &D, queue_family_index: u32) -> vk
         .expect("Couldn't create command pool")
 }
 
-fn create_command_buffers<D: DeviceV1_0>(
+fn create_command_buffer<D: DeviceV1_0>(
     device: &D,
     render_pass: vk::RenderPass,
-    command_pool: vk::CommandPool,
-    dimensions: vk::Extent2D,
-    framebuffers: &[vk::Framebuffer],
     pipeline: vk::Pipeline,
+    command_pool: vk::CommandPool,
+    framebuffer: vk::Framebuffer,
+    dimensions: vk::Extent2D,
     vertex_buffer: vk::Buffer,
-) -> Vec<vk::CommandBuffer> {
+) -> vk::CommandBuffer {
     let command_buffer_alloc_info = vk::CommandBufferAllocateInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
         p_next: ptr::null(),
@@ -1001,72 +984,65 @@ fn create_command_buffers<D: DeviceV1_0>(
         // Primary: can be submitted to a queue, but not called from other command buffers
         // Secondary: can't be directly submitted, but can be called from other command buffers
         level: vk::CommandBufferLevel::PRIMARY,
-        command_buffer_count: framebuffers.len() as u32,
+        command_buffer_count: 1,
     };
 
-    let command_buffers = unsafe { device.allocate_command_buffers(&command_buffer_alloc_info) }
-        .expect("Couldn't allocate command buffers");
+    let command_buffer = unsafe { device.allocate_command_buffers(&command_buffer_alloc_info) }
+        .expect("Couldn't allocate command buffers")[0];
 
-    command_buffers
-        .iter()
-        .enumerate()
-        .map(|(idx, &command_buffer)| {
-            // begin command buffer
-            let command_buffer_begin_info = vk::CommandBufferBeginInfo {
-                s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
-                p_next: ptr::null(),
-                flags: vk::CommandBufferUsageFlags::empty(),
-                p_inheritance_info: ptr::null(),
-            };
+    // begin command buffer
+    let command_buffer_begin_info = vk::CommandBufferBeginInfo {
+        s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
+        p_next: ptr::null(),
+        flags: vk::CommandBufferUsageFlags::empty(),
+        p_inheritance_info: ptr::null(),
+    };
 
-            unsafe { device.begin_command_buffer(command_buffer, &command_buffer_begin_info) }
-                .expect("Couldn't begin command buffer");
+    unsafe { device.begin_command_buffer(command_buffer, &command_buffer_begin_info) }
+        .expect("Couldn't begin command buffer");
 
-            // Start render pass
-            let clear_values = [vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.5, 0.5, 0.5, 1.0],
-                },
-            }];
+    // Start render pass
+    let clear_values = [vk::ClearValue {
+        color: vk::ClearColorValue {
+            float32: [0.5, 0.5, 0.5, 1.0],
+        },
+    }];
 
-            let render_pass_begin_info = vk::RenderPassBeginInfo {
-                s_type: vk::StructureType::RENDER_PASS_BEGIN_INFO,
-                p_next: ptr::null(),
-                render_pass,
-                framebuffer: framebuffers[idx],
-                render_area: vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: dimensions,
-                },
-                clear_value_count: 1,
-                p_clear_values: clear_values.as_ptr(),
-            };
+    let render_pass_begin_info = vk::RenderPassBeginInfo {
+        s_type: vk::StructureType::RENDER_PASS_BEGIN_INFO,
+        p_next: ptr::null(),
+        render_pass,
+        framebuffer,
+        render_area: vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: dimensions,
+        },
+        clear_value_count: 1,
+        p_clear_values: clear_values.as_ptr(),
+    };
 
-            unsafe {
-                device.cmd_begin_render_pass(
-                    command_buffer,
-                    &render_pass_begin_info,
-                    vk::SubpassContents::INLINE,
-                );
+    unsafe {
+        device.cmd_begin_render_pass(
+            command_buffer,
+            &render_pass_begin_info,
+            vk::SubpassContents::INLINE,
+        );
 
-                device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
 
-                let vertex_buffers = [vertex_buffer];
-                let offsets: [vk::DeviceSize; 1] = [0];
-                device.cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
+        let vertex_buffers = [vertex_buffer];
+        let offsets: [vk::DeviceSize; 1] = [0];
+        device.cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
 
-                // 3 vertices, 1 instance, first vertex 0, first instance 0
-                device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        // 3 vertices, 1 instance, first vertex 0, first instance 0
+        device.cmd_draw(command_buffer, 3, 1, 0, 0);
 
-                device.cmd_end_render_pass(command_buffer);
-            }
+        device.cmd_end_render_pass(command_buffer);
+    }
 
-            unsafe { device.end_command_buffer(command_buffer) }
-                .expect("Couldn't record command buffer!");
+    unsafe { device.end_command_buffer(command_buffer) }.expect("Couldn't record command buffer!");
 
-            command_buffer
-        })
-        .collect()
+    command_buffer
 }
 
 fn create_framebuffers<D: DeviceV1_0>(
