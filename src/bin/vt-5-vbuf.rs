@@ -272,58 +272,23 @@ pub fn main() {
         },
     ];
 
-    let vertex_buffer_info = vk::BufferCreateInfo {
-        s_type: vk::StructureType::BUFFER_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::BufferCreateFlags::empty(),
-        size: std::mem::size_of_val(&vertex_data) as u64,
-        usage: vk::BufferUsageFlags::VERTEX_BUFFER,
-        sharing_mode: vk::SharingMode::EXCLUSIVE,
+    let vertex_data_size = std::mem::size_of_val(&vertex_data) as u64;
 
-        // don't understand why this can be left blank
-        queue_family_index_count: 0,
-        p_queue_family_indices: ptr::null(),
-    };
-
-    let vertex_buffer = unsafe { device.create_buffer(&vertex_buffer_info, None) }
-        .expect("Couldn't create vertex buffer");
-
-    let binding_descriptions = Vertex::get_binding_descriptions();
-    let attribute_descriptions = Vertex::get_attribute_descriptions();
-
-    let vertex_buffer_memory_requirements =
-        unsafe { device.get_buffer_memory_requirements(vertex_buffer) };
-
-    let vertex_buffer_memory_type_index = find_memory_type(
+    let (vertex_buffer, vertex_buffer_device_memory) = create_buffer(
         &instance,
+        &device,
         physical_device,
-        vertex_buffer_memory_requirements.memory_type_bits,
+        vertex_data_size,
+        vk::BufferUsageFlags::VERTEX_BUFFER,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     );
-
-    let vertex_buffer_alloc_info = vk::MemoryAllocateInfo {
-        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
-        p_next: ptr::null(),
-
-        // this size can be different from the size in vertex_buffer_info! I
-        // think the minimum allocation on the GPU is 256 bytes or something.
-        allocation_size: vertex_buffer_memory_requirements.size,
-        memory_type_index: vertex_buffer_memory_type_index,
-    };
-
-    let vertex_buffer_device_memory =
-        unsafe { device.allocate_memory(&vertex_buffer_alloc_info, None) }
-            .expect("Couldn't allocate vertex buffer device memory");
-
-    unsafe { device.bind_buffer_memory(vertex_buffer, vertex_buffer_device_memory, 0) }
-        .expect("Couldn't bind vertex buffer");
 
     unsafe {
         let mapped_memory = device
             .map_memory(
                 vertex_buffer_device_memory,
                 0,
-                vertex_buffer_info.size,
+                vertex_data_size,
                 vk::MemoryMapFlags::empty(),
             )
             .expect("Couldn't map vertex buffer memory") as *mut Vertex;
@@ -340,6 +305,9 @@ pub fn main() {
     let pipeline_layout = create_pipeline_layout(&device);
 
     // pipeline
+    let binding_descriptions = Vertex::get_binding_descriptions();
+    let attribute_descriptions = Vertex::get_attribute_descriptions();
+
     let mut pipeline = create_pipeline(
         &device,
         render_pass,
@@ -625,6 +593,60 @@ pub fn main() {
         debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
         instance.destroy_instance(None);
     }
+}
+
+fn create_buffer<I: InstanceV1_0, D: DeviceV1_0>(
+    instance: &I,
+    device: &D,
+    physical_device: vk::PhysicalDevice,
+    bytes: u64,
+    usage: vk::BufferUsageFlags,
+    memory_properties: vk::MemoryPropertyFlags,
+) -> (vk::Buffer, vk::DeviceMemory) {
+    let vertex_buffer_info = vk::BufferCreateInfo {
+        s_type: vk::StructureType::BUFFER_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::BufferCreateFlags::empty(),
+        size: bytes,
+        usage,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+
+        // don't understand why this can be left blank
+        queue_family_index_count: 0,
+        p_queue_family_indices: ptr::null(),
+    };
+
+    let vertex_buffer = unsafe { device.create_buffer(&vertex_buffer_info, None) }
+        .expect("Couldn't create vertex buffer");
+
+    let vertex_buffer_memory_requirements =
+        unsafe { device.get_buffer_memory_requirements(vertex_buffer) };
+
+    let vertex_buffer_memory_type_index = find_memory_type(
+        instance,
+        physical_device,
+        vertex_buffer_memory_requirements.memory_type_bits,
+        memory_properties,
+    );
+
+    let vertex_buffer_alloc_info = vk::MemoryAllocateInfo {
+        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
+        p_next: ptr::null(),
+
+        // this size can be different from the size in vertex_buffer_info! I
+        // think the minimum allocation on the GPU is 256 bytes or something.
+        allocation_size: vertex_buffer_memory_requirements.size,
+        memory_type_index: vertex_buffer_memory_type_index,
+    };
+
+    let vertex_buffer_device_memory =
+        unsafe { device.allocate_memory(&vertex_buffer_alloc_info, None) }
+            .expect("Couldn't allocate vertex buffer device memory");
+
+    unsafe { device.bind_buffer_memory(vertex_buffer, vertex_buffer_device_memory, 0) }
+    .expect("Couldn't bind vertex buffer");
+
+    (vertex_buffer, vertex_buffer_device_memory)
 }
 
 // taken from vulkan-tutorial-rust
