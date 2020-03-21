@@ -619,21 +619,33 @@ pub fn main() {
 }
 
 fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    let st = std::time::Instant::now();
+
     use lyon::math::{point, Point};
     use lyon::path::Path;
     use lyon::tessellation::*;
-    use lyon_tessellation::{StrokeOptions, StrokeTessellator};
+    use lyon_tessellation::{StrokeOptions, StrokeTessellator, LineCap};
     use std::f32::consts::PI;
 
-    let time = std::time::UNIX_EPOCH.elapsed().unwrap().subsec_millis() as f32 / 1_000.0;
+    let elapsed = std::time::UNIX_EPOCH.elapsed().unwrap();
+    let secs = elapsed.as_secs() as f64;
+    let millis = elapsed.subsec_millis() as f64 / 1_000.0;
+    let time = secs + millis;
+
+    let x = (time % 4.0) as f32;
 
     let mut builder = Path::builder();
 
     builder.move_to(point(0.0, 0.0));
-    builder.line_to(point((time * PI * 2.0).sin(), (time * PI * 2.0).cos()));
-
-    /*
+    builder.line_to(point((x * PI * 0.5).sin(), (x * PI * 0.5).cos()));
+    builder.quadratic_bezier_to(point(0.0, 0.0), point(-1.0, -1.0));
+    builder.line_to(point((x * PI * 0.5).sin(), (x * PI * 0.5).cos()));
+    builder.quadratic_bezier_to(point(0.0, 0.0), point(1.0, -1.0));
+    builder.line_to(point((x * PI * 0.5).sin(), (x * PI * 0.5).cos()));
     builder.quadratic_bezier_to(point(0.0, 0.0), point(-1.0, 1.0));
+    builder.line_to(point((x * PI * 0.5).sin(), (x * PI * 0.5).cos()));
+    builder.quadratic_bezier_to(point(0.0, 0.0), point(1.0, 1.0));
+    /*
     builder.quadratic_bezier_to(point(2.0, 0.0), point(2.0, 1.0));
     builder.cubic_bezier_to(point(1.0, 1.0), point(0.0, 1.0), point(0.0, 0.0));
     builder.close();
@@ -650,8 +662,10 @@ fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
             .tessellate(
                 &path,
                 &StrokeOptions::DEFAULT
-                    .with_line_width(0.01)
-                    .with_tolerance(0.001),
+                    .with_line_width(0.05)
+                    .with_tolerance(0.000001)
+                    .with_start_cap(LineCap::Round)
+                    .with_end_cap(LineCap::Round),
                 &mut BuffersBuilder::new(&mut geometry, |pos: Point, _: StrokeAttributes| Vertex {
                     position: pos.to_array(),
                     color: [
@@ -663,6 +677,8 @@ fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
             )
             .unwrap();
     }
+
+    println!("Lyon took: {} ms", get_elapsed(st) * 1_000.0);
 
     (geometry.vertices, geometry.indices)
 }
