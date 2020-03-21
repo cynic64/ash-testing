@@ -279,60 +279,17 @@ pub fn main() {
         },
     ];
 
-    let vertex_data_size = size_of_vec(&vertex_data) as u64;
-
     let device_memory_properties =
         unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
-    // first we copy the data from the CPU to a GPU buffer visible to the CPU
-    // (which would be slower for the GPU to use if we went on to use it as a
-    // vertex buffer), then we copy from that GPU buffer into another GPU buffer
-    // that is only visible to the GPU, which is faster to use as a vertex
-    // buffer but cannot be directly copied into by the CPU.
-    let (vertex_staging_buffer, vertex_staging_buffer_memory) = create_buffer(
-        &device,
-        device_memory_properties,
-        vertex_data_size,
-        vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::VERTEX_BUFFER,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    );
-
-    unsafe {
-        let mapped_memory = device
-            .map_memory(
-                vertex_staging_buffer_memory,
-                0,
-                vertex_data_size,
-                vk::MemoryMapFlags::empty(),
-            )
-            .expect("Couldn't map vertex buffer memory") as *mut Vertex;
-
-        mapped_memory.copy_from_nonoverlapping(vertex_data.as_ptr(), vertex_data.len());
-
-        device.unmap_memory(vertex_staging_buffer_memory);
-    }
-
-    let (vertex_buffer, vertex_buffer_memory) = create_buffer(
-        &device,
-        device_memory_properties,
-        vertex_data_size,
-        vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    );
-
-    copy_buffer(
+    let (vertex_buffer, vertex_buffer_memory) = create_device_local_buffer(
         &device,
         queue,
         command_pool,
-        vertex_staging_buffer,
-        vertex_buffer,
-        vertex_data_size,
+        device_memory_properties,
+        vk::BufferUsageFlags::VERTEX_BUFFER,
+        &vertex_data,
     );
-
-    unsafe {
-        device.destroy_buffer(vertex_staging_buffer, None);
-        device.free_memory(vertex_staging_buffer_memory, None);
-    }
 
     // render pass
     let render_pass = create_render_pass(&device);
@@ -626,6 +583,71 @@ pub fn main() {
         debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
         instance.destroy_instance(None);
     }
+}
+
+fn create_device_local_buffer<D: DeviceV1_0, T>(
+    device: &D,
+    queue: vk::Queue,
+    command_pool: vk::CommandPool,
+    device_memory_properties: vk::PhysicalDeviceMemoryProperties,
+    usage: vk::BufferUsageFlags,
+    data: &[T],
+) -> (vk::Buffer, vk::DeviceMemory) {
+    // TRANSFER_DST will be added to usage, you don't have to include it
+
+    let buffer_size = (std::mem::size_of::<T>() * data.len()) as u64;
+
+    // first we copy the data from the CPU to a GPU buffer visible to the CPU
+    // (which would be slower for the GPU to use if we went on to use it as a
+    // vertex buffer), then we copy from that GPU buffer into another GPU buffer
+    // that is only visible to the GPU, which is faster to use as a vertex
+    // buffer but cannot be directly copied into by the CPU.
+    let (staging_buffer, staging_buffer_memory) = create_buffer(
+        device,
+        device_memory_properties,
+        buffer_size,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    );
+
+    unsafe {
+        let mapped_memory = device
+            .map_memory(
+                staging_buffer_memory,
+                0,
+                buffer_size,
+                vk::MemoryMapFlags::empty(),
+            )
+            .expect("Couldn't map vertex buffer memory") as *mut T;
+
+        mapped_memory.copy_from_nonoverlapping(data.as_ptr(), data.len());
+
+        device.unmap_memory(staging_buffer_memory);
+    }
+
+    let (buffer, buffer_memory) = create_buffer(
+        device,
+        device_memory_properties,
+        buffer_size,
+        usage | vk::BufferUsageFlags::TRANSFER_DST,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    );
+
+    copy_buffer(
+        device,
+        queue,
+        command_pool,
+        staging_buffer,
+        buffer,
+        buffer_size,
+    );
+
+    unsafe {
+        device.destroy_buffer(staging_buffer, None);
+        device.free_memory(staging_buffer_memory, None);
+    }
+
+    (buffer, buffer_memory)
 }
 
 fn copy_buffer<D: DeviceV1_0>(
@@ -1503,11 +1525,4 @@ fn relative_path(local_path: &str) -> PathBuf {
 
 fn get_elapsed(start: std::time::Instant) -> f64 {
     start.elapsed().as_secs() as f64 + start.elapsed().subsec_nanos() as f64 / 1_000_000_000.0
-}
-
-fn size_of_vec<T>(vec: &Vec<T>) -> usize {
-    // std::mem::size_of_val accurately returns the size of arrays but does not
-    // work for vectors because they are allocated on the heap, so we can't use
-    // it here
-    std::mem::size_of::<T>() * vec.len()
 }
