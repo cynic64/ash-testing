@@ -40,14 +40,22 @@ const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 // we cannot know which image will be used before calling acquire_next_image,
 // for which we already need a semaphore ready for it to signal.
 
-// therefore, there is no direct link between SyncSets and swapchain images -
-// each time we draw a new frame, wait for the oldest sync_set to finish and use
-// that.
-struct SyncSet {
+// therefore, there is no direct link between FlyingFrames and swapchain images
+// - each time we draw a new frame, wait for the oldest sync_set to finish and
+// use that.
+struct FlyingFrame {
     image_available_semaphore: vk::Semaphore,
     render_finished_semaphore: vk::Semaphore,
     render_finished_fence: vk::Fence,
     command_buffer: Option<vk::CommandBuffer>,
+    mesh_buffers: Option<MeshBuffers>,
+}
+
+struct MeshBuffers {
+    vertex_buffer: vk::Buffer,
+    vertex_buffer_memory: vk::DeviceMemory,
+    index_buffer: vk::Buffer,
+    index_buffer_memory: vk::DeviceMemory,
 }
 
 #[repr(C)]
@@ -263,26 +271,6 @@ pub fn main() {
     let device_memory_properties =
         unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
-    let (vertex_data, index_data) = create_mesh();
-
-    let (vertex_buffer, vertex_buffer_memory) = create_device_local_buffer(
-        &device,
-        queue,
-        command_pool,
-        device_memory_properties,
-        vk::BufferUsageFlags::VERTEX_BUFFER,
-        &vertex_data,
-    );
-
-    let (index_buffer, index_buffer_memory) = create_device_local_buffer(
-        &device,
-        queue,
-        command_pool,
-        device_memory_properties,
-        vk::BufferUsageFlags::INDEX_BUFFER,
-        &index_data,
-    );
-
     // render pass
     let render_pass = create_render_pass(&device);
 
@@ -307,8 +295,8 @@ pub fn main() {
     let mut framebuffers =
         create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
 
-    // sync objects (one for each swapchain image)
-    let mut sync_sets = create_sync_objects(&device);
+    // flying frames (one for each swapchain image)
+    let mut flying_frames = create_flying_frames(&device);
 
     // used to check whether rendering to a swapchain image has finished,
     // necessary because we have more sync sets than swapchain images
@@ -391,11 +379,11 @@ pub fn main() {
             break;
         }
 
-        let sync_set = &sync_sets[frames_drawn % MAX_FRAMES_IN_FLIGHT];
+        let frame = &flying_frames[frames_drawn % MAX_FRAMES_IN_FLIGHT];
 
-        let image_available_semaphore = sync_set.image_available_semaphore;
-        let render_finished_semaphore = sync_set.render_finished_semaphore;
-        let render_finished_fence = sync_set.render_finished_fence;
+        let image_available_semaphore = frame.image_available_semaphore;
+        let render_finished_semaphore = frame.render_finished_semaphore;
+        let render_finished_fence = frame.render_finished_fence;
 
         // we can't use this sync set until whichever rendering was using it
         // previously is finished, so wait for rendering to finished (use the
@@ -404,15 +392,55 @@ pub fn main() {
             .expect("Couldn't wait for previous sync set to finish rendering");
 
         // since rendering has finished, we can free that command buffer
-        if let Some(command_buffer) = sync_set.command_buffer {
+        if let Some(command_buffer) = frame.command_buffer {
             unsafe { device.free_command_buffers(command_pool, &[command_buffer]) };
         } else {
             // should only happen when swapchain images are first used, panic
             // otherwise
             if frames_drawn >= MAX_FRAMES_IN_FLIGHT {
-                panic!("No command buffer in sync set on frame {}", frames_drawn);
+                panic!(
+                    "No command buffer in flying frame on frame {}",
+                    frames_drawn
+                );
             }
         }
+
+        // we can also now destroy the previously created vertex and index
+        // buffers
+        if let Some(mesh_buffers) = &frame.mesh_buffers {
+            unsafe { mesh_buffers.destroy(&device) };
+        } else {
+            if frames_drawn >= MAX_FRAMES_IN_FLIGHT {
+                panic!("No mesh buffers in flying frame on frame {}", frames_drawn);
+            }
+        }
+
+        let (vertex_data, index_data) = create_mesh();
+
+        let (vertex_buffer, vertex_buffer_memory) = create_device_local_buffer(
+            &device,
+            queue,
+            command_pool,
+            device_memory_properties,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            &vertex_data,
+        );
+
+        let (index_buffer, index_buffer_memory) = create_device_local_buffer(
+            &device,
+            queue,
+            command_pool,
+            device_memory_properties,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            &index_data,
+        );
+
+        flying_frames[frames_drawn % MAX_FRAMES_IN_FLIGHT].mesh_buffers = Some(MeshBuffers {
+            vertex_buffer,
+            vertex_buffer_memory,
+            index_buffer,
+            index_buffer_memory,
+        });
 
         // image_available_semaphore will be signalled once the swapchain image
         // is actually available and not being displayed anymore -
@@ -475,7 +503,7 @@ pub fn main() {
             index_data.len() as u32,
         );
 
-        sync_sets[frames_drawn % MAX_FRAMES_IN_FLIGHT].command_buffer = Some(command_buffer);
+        flying_frames[frames_drawn % MAX_FRAMES_IN_FLIGHT].command_buffer = Some(command_buffer);
 
         // submit command buffer
         let wait_semaphores = [image_available_semaphore];
@@ -547,14 +575,13 @@ pub fn main() {
 
     // destroy objects
     unsafe {
-        device.destroy_buffer(vertex_buffer, None);
-        device.free_memory(vertex_buffer_memory, None);
-        device.destroy_buffer(index_buffer, None);
-        device.free_memory(index_buffer_memory, None);
-
-        sync_sets.iter().for_each(|ss| {
-            if let Some(command_buffer) = ss.command_buffer {
+        flying_frames.iter().for_each(|f| {
+            if let Some(command_buffer) = f.command_buffer {
                 device.free_command_buffers(command_pool, &[command_buffer]);
+            }
+
+            if let Some(mesh_buffers) = &f.mesh_buffers {
+                mesh_buffers.destroy(&device);
             }
         });
 
@@ -573,10 +600,10 @@ pub fn main() {
         device.destroy_pipeline_layout(pipeline_layout, None);
         device.destroy_render_pass(render_pass, None);
 
-        sync_sets.iter().for_each(|set| {
-            device.destroy_semaphore(set.image_available_semaphore, None);
-            device.destroy_semaphore(set.render_finished_semaphore, None);
-            device.destroy_fence(set.render_finished_fence, None);
+        flying_frames.iter().for_each(|f| {
+            device.destroy_semaphore(f.image_available_semaphore, None);
+            device.destroy_semaphore(f.render_finished_semaphore, None);
+            device.destroy_fence(f.render_finished_fence, None);
         });
 
         device.destroy_command_pool(command_pool, None);
@@ -595,33 +622,46 @@ fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
     use lyon::math::{point, Point};
     use lyon::path::Path;
     use lyon::tessellation::*;
+    use lyon_tessellation::{StrokeOptions, StrokeTessellator};
+    use std::f32::consts::PI;
+
+    let time = std::time::UNIX_EPOCH.elapsed().unwrap().subsec_millis() as f32 / 1_000.0;
 
     let mut builder = Path::builder();
 
-    builder.move_to(point(0.0, -1.0));
-    builder.line_to(point(1.0, 1.0));
+    builder.move_to(point(0.0, 0.0));
+    builder.line_to(point((time * PI * 2.0).sin(), (time * PI * 2.0).cos()));
+
+    /*
     builder.quadratic_bezier_to(point(0.0, 0.0), point(-1.0, 1.0));
     builder.quadratic_bezier_to(point(2.0, 0.0), point(2.0, 1.0));
     builder.cubic_bezier_to(point(1.0, 1.0), point(0.0, 1.0), point(0.0, 0.0));
     builder.close();
+    */
 
     let path = builder.build();
 
     // Will contain the result of the tessellation.
     let mut geometry: VertexBuffers<Vertex, u32> = VertexBuffers::new();
-    let mut tessellator = FillTessellator::new();
+    let mut tessellator = StrokeTessellator::new();
     {
         // Compute the tessellation.
-        tessellator.tessellate_path(
-            &path,
-            &FillOptions::tolerance(0.0001),
-            &mut BuffersBuilder::new(&mut geometry, |pos: Point, _: FillAttributes| {
-                Vertex {
+        tessellator
+            .tessellate(
+                &path,
+                &StrokeOptions::DEFAULT
+                    .with_line_width(0.01)
+                    .with_tolerance(0.001),
+                &mut BuffersBuilder::new(&mut geometry, |pos: Point, _: StrokeAttributes| Vertex {
                     position: pos.to_array(),
-                    color: [1.0, 1.0, 1.0],
-                }
-            }),
-        ).unwrap();
+                    color: [
+                        pos.x * 0.5 + 0.5,
+                        pos.y * 0.5 + 0.5,
+                        (pos.x * 0.5 + 0.5) * (pos.y * 0.5 + 0.5),
+                    ],
+                }),
+            )
+            .unwrap();
     }
 
     (geometry.vertices, geometry.indices)
@@ -1109,7 +1149,7 @@ fn cleanup_swapchain<D: DeviceV1_0>(
     }
 }
 
-fn create_sync_objects<D: DeviceV1_0>(device: &D) -> Vec<SyncSet> {
+fn create_flying_frames<D: DeviceV1_0>(device: &D) -> Vec<FlyingFrame> {
     let semaphore_info = vk::SemaphoreCreateInfo {
         s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
         p_next: ptr::null(),
@@ -1123,7 +1163,7 @@ fn create_sync_objects<D: DeviceV1_0>(device: &D) -> Vec<SyncSet> {
     };
 
     (0..MAX_FRAMES_IN_FLIGHT)
-        .map(|_| SyncSet {
+        .map(|_| FlyingFrame {
             image_available_semaphore: unsafe { device.create_semaphore(&semaphore_info, None) }
                 .expect("Couldn't create semaphore"),
             render_finished_semaphore: unsafe { device.create_semaphore(&semaphore_info, None) }
@@ -1131,6 +1171,7 @@ fn create_sync_objects<D: DeviceV1_0>(device: &D) -> Vec<SyncSet> {
             render_finished_fence: unsafe { device.create_fence(&fence_info, None) }
                 .expect("Couldn't create fence"),
             command_buffer: None,
+            mesh_buffers: None,
         })
         .collect()
 }
@@ -1574,4 +1615,16 @@ fn relative_path(local_path: &str) -> PathBuf {
 
 fn get_elapsed(start: std::time::Instant) -> f64 {
     start.elapsed().as_secs() as f64 + start.elapsed().subsec_nanos() as f64 / 1_000_000_000.0
+}
+
+impl MeshBuffers {
+    unsafe fn destroy<D: DeviceV1_0>(&self, device: &D) {
+        // unsafe because we destroy the Buffers and DeviceMemorys but keep the
+        // references to them in Self
+
+        device.destroy_buffer(self.vertex_buffer, None);
+        device.free_memory(self.vertex_buffer_memory, None);
+        device.destroy_buffer(self.index_buffer, None);
+        device.free_memory(self.index_buffer_memory, None);
+    }
 }
