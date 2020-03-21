@@ -11,7 +11,7 @@ use std::ptr;
 
 use memoffset::offset_of;
 
-use ash_testing::{get_elapsed, relative_path};
+use ash_testing::{get_elapsed, relative_path, LoopTimer};
 
 const MAX_FRAMES_IN_FLIGHT: usize = 4;
 
@@ -311,6 +311,11 @@ pub fn main() {
 
     let mut must_recreate_swapchain = false;
 
+    // timers
+    let mut timer_mesh_gen = LoopTimer::new("Mesh generation".to_string());
+    let mut timer_create_buffers = LoopTimer::new("Buffer creation".to_string());
+    let mut timer_draw = LoopTimer::new("Drawing".to_string());
+
     loop {
         if must_recreate_swapchain {
             unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
@@ -417,33 +422,6 @@ pub fn main() {
             }
         }
 
-        let (vertex_data, index_data) = create_mesh();
-
-        let (vertex_buffer, vertex_buffer_memory) = create_device_local_buffer(
-            &device,
-            queue,
-            command_pool,
-            device_memory_properties,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            &vertex_data,
-        );
-
-        let (index_buffer, index_buffer_memory) = create_device_local_buffer(
-            &device,
-            queue,
-            command_pool,
-            device_memory_properties,
-            vk::BufferUsageFlags::INDEX_BUFFER,
-            &index_data,
-        );
-
-        flying_frames[frames_drawn % MAX_FRAMES_IN_FLIGHT].mesh_buffers = Some(MeshBuffers {
-            vertex_buffer,
-            vertex_buffer_memory,
-            index_buffer,
-            index_buffer_memory,
-        });
-
         // image_available_semaphore will be signalled once the swapchain image
         // is actually available and not being displayed anymore -
         // acquire_next_image will return the instant it knows which image index
@@ -486,6 +464,41 @@ pub fn main() {
                 );
             }
         }
+
+        timer_draw.stop();
+
+        timer_mesh_gen.start();
+        let (vertex_data, index_data) = create_mesh();
+        timer_mesh_gen.stop();
+
+        timer_create_buffers.start();
+
+        let (vertex_buffer, vertex_buffer_memory) = create_device_local_buffer(
+            &device,
+            queue,
+            command_pool,
+            device_memory_properties,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            &vertex_data,
+        );
+
+        let (index_buffer, index_buffer_memory) = create_device_local_buffer(
+            &device,
+            queue,
+            command_pool,
+            device_memory_properties,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            &index_data,
+        );
+
+        timer_create_buffers.stop();
+
+        flying_frames[frames_drawn % MAX_FRAMES_IN_FLIGHT].mesh_buffers = Some(MeshBuffers {
+            vertex_buffer,
+            vertex_buffer_memory,
+            index_buffer,
+            index_buffer_memory,
+        });
 
         // set the render_finished_fence associated with this swapchain image to
         // the fence that will be signalled when we finish rendering - in other
@@ -530,6 +543,8 @@ pub fn main() {
             p_signal_semaphores: signal_semaphores.as_ptr(),
         };
 
+        timer_draw.start();
+
         // somebody else was previously using this fence and we waited until it
         // was signalled (operation completed). now we need to reset it, because
         // we aren't yet done but the fence says we are.
@@ -572,6 +587,10 @@ pub fn main() {
         "Average delta in ms: {:.5}",
         get_elapsed(start_time) / frames_drawn as f64 * 1_000.0
     );
+
+    timer_draw.print();
+    timer_create_buffers.print();
+    timer_mesh_gen.print();
 
     unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
 
@@ -624,7 +643,7 @@ fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
     use lyon::math::{point, Point};
     use lyon::path::Path;
     use lyon::tessellation::*;
-    use lyon_tessellation::{StrokeOptions, StrokeTessellator, LineCap};
+    use lyon_tessellation::{LineCap, StrokeOptions, StrokeTessellator};
     use std::f32::consts::PI;
 
     let elapsed = std::time::UNIX_EPOCH.elapsed().unwrap();
