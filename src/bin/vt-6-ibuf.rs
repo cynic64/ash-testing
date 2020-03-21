@@ -491,6 +491,7 @@ pub fn main() {
             swapchain_dims,
             vertex_buffer,
             index_buffer,
+            index_data.len() as u32,
         );
 
         sync_sets[frames_drawn % MAX_FRAMES_IN_FLIGHT].command_buffer = Some(command_buffer);
@@ -1138,6 +1139,7 @@ fn create_command_buffer<D: DeviceV1_0>(
     dimensions: vk::Extent2D,
     vertex_buffer: vk::Buffer,
     index_buffer: vk::Buffer,
+    index_count: u32,
 ) -> vk::CommandBuffer {
     let command_buffer_alloc_info = vk::CommandBufferAllocateInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
@@ -1200,8 +1202,9 @@ fn create_command_buffer<D: DeviceV1_0>(
         // bind index buffer
         device.cmd_bind_index_buffer(command_buffer, index_buffer, 0, vk::IndexType::UINT32);
 
-        // 6 indices, 1 instance, first index 0, vertex offset 0, first instance 0
-        device.cmd_draw_indexed(command_buffer, 6, 1, 0, 0, 0);
+        // <index_count> indices, 1 instance, first index 0, vertex offset 0,
+        // first instance 0
+        device.cmd_draw_indexed(command_buffer, index_count, 1, 0, 0, 0);
 
         device.cmd_end_render_pass(command_buffer);
     }
