@@ -259,7 +259,10 @@ pub fn main() {
     // command pool
     let command_pool = create_command_pool(&device, queue_family_index);
 
-    // vbuf stuff
+    // vbuf / ibuf creation
+    let device_memory_properties =
+        unsafe { instance.get_physical_device_memory_properties(physical_device) };
+
     let vertex_data = vec![
         Vertex {
             position: [-0.5, -0.5],
@@ -279,8 +282,7 @@ pub fn main() {
         },
     ];
 
-    let device_memory_properties =
-        unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let index_data = vec![0, 1, 2, 1, 2, 3];
 
     let (vertex_buffer, vertex_buffer_memory) = create_device_local_buffer(
         &device,
@@ -289,6 +291,15 @@ pub fn main() {
         device_memory_properties,
         vk::BufferUsageFlags::VERTEX_BUFFER,
         &vertex_data,
+    );
+
+    let (index_buffer, index_buffer_memory) = create_device_local_buffer(
+        &device,
+        queue,
+        command_pool,
+        device_memory_properties,
+        vk::BufferUsageFlags::INDEX_BUFFER,
+        &index_data,
     );
 
     // render pass
@@ -479,6 +490,7 @@ pub fn main() {
             framebuffers[image_idx as usize],
             swapchain_dims,
             vertex_buffer,
+            index_buffer,
         );
 
         sync_sets[frames_drawn % MAX_FRAMES_IN_FLIGHT].command_buffer = Some(command_buffer);
@@ -555,13 +567,18 @@ pub fn main() {
     unsafe {
         device.destroy_buffer(vertex_buffer, None);
         device.free_memory(vertex_buffer_memory, None);
+        device.destroy_buffer(index_buffer, None);
+        device.free_memory(index_buffer_memory, None);
+
         sync_sets.iter().for_each(|ss| {
             if let Some(command_buffer) = ss.command_buffer {
                 device.free_command_buffers(command_pool, &[command_buffer]);
             }
         });
+
         device.destroy_shader_module(frag_module, None);
         device.destroy_shader_module(vert_module, None);
+
         cleanup_swapchain(
             &device,
             &swapchain_creator,
@@ -570,17 +587,24 @@ pub fn main() {
             swapchain_image_views,
             swapchain,
         );
+
         device.destroy_pipeline_layout(pipeline_layout, None);
         device.destroy_render_pass(render_pass, None);
+
         sync_sets.iter().for_each(|set| {
             device.destroy_semaphore(set.image_available_semaphore, None);
             device.destroy_semaphore(set.render_finished_semaphore, None);
             device.destroy_fence(set.render_finished_fence, None);
         });
+
         device.destroy_command_pool(command_pool, None);
+
         device.destroy_device(None);
+
         surface_loader.destroy_surface(surface, None);
+
         debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
+
         instance.destroy_instance(None);
     }
 }
@@ -1113,6 +1137,7 @@ fn create_command_buffer<D: DeviceV1_0>(
     framebuffer: vk::Framebuffer,
     dimensions: vk::Extent2D,
     vertex_buffer: vk::Buffer,
+    index_buffer: vk::Buffer,
 ) -> vk::CommandBuffer {
     let command_buffer_alloc_info = vk::CommandBufferAllocateInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
@@ -1167,12 +1192,16 @@ fn create_command_buffer<D: DeviceV1_0>(
 
         device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
 
+        // bind vertex buffer
         let vertex_buffers = [vertex_buffer];
         let offsets: [vk::DeviceSize; 1] = [0];
         device.cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
 
-        // 3 vertices, 1 instance, first vertex 0, first instance 0
-        device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        // bind index buffer
+        device.cmd_bind_index_buffer(command_buffer, index_buffer, 0, vk::IndexType::UINT32);
+
+        // 6 indices, 1 instance, first index 0, vertex offset 0, first instance 0
+        device.cmd_draw_indexed(command_buffer, 6, 1, 0, 0, 0);
 
         device.cmd_end_render_pass(command_buffer);
     }
