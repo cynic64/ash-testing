@@ -11,7 +11,7 @@ use std::ptr;
 
 use memoffset::offset_of;
 
-use ash_testing::{relative_path, get_elapsed};
+use ash_testing::{get_elapsed, relative_path};
 
 const MAX_FRAMES_IN_FLIGHT: usize = 4;
 
@@ -738,9 +738,8 @@ fn create_buffer<I: InstanceV1_0, D: DeviceV1_0>(
         memory_type_index: vertex_buffer_memory_type_index,
     };
 
-    let vertex_buffer_memory =
-        unsafe { device.allocate_memory(&vertex_buffer_alloc_info, None) }
-            .expect("Couldn't allocate vertex buffer device memory");
+    let vertex_buffer_memory = unsafe { device.allocate_memory(&vertex_buffer_alloc_info, None) }
+        .expect("Couldn't allocate vertex buffer device memory");
 
     unsafe { device.bind_buffer_memory(vertex_buffer, vertex_buffer_memory, 0) }
         .expect("Couldn't bind vertex buffer");
