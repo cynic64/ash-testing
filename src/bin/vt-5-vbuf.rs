@@ -256,6 +256,9 @@ pub fn main() {
 
     let shader_stages = [vert_stage_info, frag_stage_info];
 
+    // command pool
+    let command_pool = create_command_pool(&device, queue_family_index);
+
     // vbuf stuff
     let vertex_data = vec![
         Vertex {
@@ -272,21 +275,29 @@ pub fn main() {
         },
     ];
 
-    let vertex_data_size = std::mem::size_of_val(&vertex_data) as u64;
+    // std::mem::size_of_val accurately returns the size of arrays but does not
+    // work for vectors because they are allocated on the heap, so we can't use
+    // it here
+    let vertex_data_size = (std::mem::size_of::<Vertex>() * vertex_data.len()) as u64;
 
-    let (vertex_buffer, vertex_buffer_device_memory) = create_buffer(
+    // first we copy the data from the CPU to a GPU buffer visible to the CPU
+    // (which would be slower for the GPU to use if we went on to use it as a
+    // vertex buffer), then we copy from that GPU buffer into another GPU buffer
+    // that is only visible to the GPU, which is faster to use as a vertex
+    // buffer but cannot be directly copied into by the CPU.
+    let (vertex_staging_buffer, vertex_staging_buffer_memory) = create_buffer(
         &instance,
         &device,
         physical_device,
         vertex_data_size,
-        vk::BufferUsageFlags::VERTEX_BUFFER,
+        vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::VERTEX_BUFFER,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     );
 
     unsafe {
         let mapped_memory = device
             .map_memory(
-                vertex_buffer_device_memory,
+                vertex_staging_buffer_memory,
                 0,
                 vertex_data_size,
                 vk::MemoryMapFlags::empty(),
@@ -295,7 +306,30 @@ pub fn main() {
 
         mapped_memory.copy_from_nonoverlapping(vertex_data.as_ptr(), vertex_data.len());
 
-        device.unmap_memory(vertex_buffer_device_memory);
+        device.unmap_memory(vertex_staging_buffer_memory);
+    }
+
+    let (vertex_buffer, vertex_buffer_memory) = create_buffer(
+        &instance,
+        &device,
+        physical_device,
+        vertex_data_size,
+        vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    );
+
+    copy_buffer(
+        &device,
+        queue,
+        command_pool,
+        vertex_staging_buffer,
+        vertex_buffer,
+        vertex_data_size,
+    );
+
+    unsafe {
+        device.destroy_buffer(vertex_staging_buffer, None);
+        device.free_memory(vertex_staging_buffer_memory, None);
     }
 
     // render pass
@@ -321,9 +355,6 @@ pub fn main() {
     // framebuffer creation
     let mut framebuffers =
         create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
-
-    // command pool
-    let command_pool = create_command_pool(&device, queue_family_index);
 
     // sync objects (one for each swapchain image)
     let mut sync_sets = create_sync_objects(&device);
@@ -564,7 +595,7 @@ pub fn main() {
     // destroy objects
     unsafe {
         device.destroy_buffer(vertex_buffer, None);
-        device.free_memory(vertex_buffer_device_memory, None);
+        device.free_memory(vertex_buffer_memory, None);
         sync_sets.iter().for_each(|ss| {
             if let Some(command_buffer) = ss.command_buffer {
                 device.free_command_buffers(command_pool, &[command_buffer]);
@@ -593,6 +624,72 @@ pub fn main() {
         debug_utils_loader.destroy_debug_utils_messenger(debug_utils_messenger, None);
         instance.destroy_instance(None);
     }
+}
+
+fn copy_buffer<D: DeviceV1_0>(
+    device: &D,
+    queue: vk::Queue,
+    command_pool: vk::CommandPool,
+    source: vk::Buffer,
+    dest: vk::Buffer,
+    bytes: u64,
+) {
+    let command_buffer_alloc_info = vk::CommandBufferAllocateInfo {
+        s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
+        p_next: ptr::null(),
+        command_pool,
+        // Primary: can be submitted to a queue, but not called from other command buffers
+        // Secondary: can't be directly submitted, but can be called from other command buffers
+        level: vk::CommandBufferLevel::PRIMARY,
+        command_buffer_count: 1,
+    };
+
+    let command_buffer = unsafe { device.allocate_command_buffers(&command_buffer_alloc_info) }
+        .expect("Couldn't allocate command buffers")[0];
+
+    // begin command buffer
+    let command_buffer_begin_info = vk::CommandBufferBeginInfo {
+        s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
+        p_next: ptr::null(),
+        flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+        p_inheritance_info: ptr::null(),
+    };
+
+    unsafe { device.begin_command_buffer(command_buffer, &command_buffer_begin_info) }
+        .expect("Couldn't begin command buffer");
+
+    // copy
+    let copy_region = [vk::BufferCopy {
+        src_offset: 0,
+        dst_offset: 0,
+        size: bytes,
+    }];
+
+    unsafe { device.cmd_copy_buffer(command_buffer, source, dest, &copy_region) };
+
+    unsafe { device.end_command_buffer(command_buffer) }.expect("Couldn't record command buffer!");
+
+    let command_buffers = [command_buffer];
+
+    // submit
+    let submit_info = [vk::SubmitInfo {
+        s_type: vk::StructureType::SUBMIT_INFO,
+        p_next: ptr::null(),
+        wait_semaphore_count: 0,
+        p_wait_semaphores: ptr::null(),
+        p_wait_dst_stage_mask: ptr::null(),
+        command_buffer_count: 1,
+        p_command_buffers: command_buffers.as_ptr(),
+        signal_semaphore_count: 0,
+        p_signal_semaphores: ptr::null(),
+    }];
+
+    unsafe { device.queue_submit(queue, &submit_info, vk::Fence::null()) }
+        .expect("Couldn't submit command buffer");
+
+    unsafe { device.queue_wait_idle(queue) }.expect("Couldn't wait for queue to become idle");
+
+    unsafe { device.free_command_buffers(command_pool, &command_buffers) };
 }
 
 fn create_buffer<I: InstanceV1_0, D: DeviceV1_0>(
@@ -639,14 +736,14 @@ fn create_buffer<I: InstanceV1_0, D: DeviceV1_0>(
         memory_type_index: vertex_buffer_memory_type_index,
     };
 
-    let vertex_buffer_device_memory =
+    let vertex_buffer_memory =
         unsafe { device.allocate_memory(&vertex_buffer_alloc_info, None) }
             .expect("Couldn't allocate vertex buffer device memory");
 
-    unsafe { device.bind_buffer_memory(vertex_buffer, vertex_buffer_device_memory, 0) }
-    .expect("Couldn't bind vertex buffer");
+    unsafe { device.bind_buffer_memory(vertex_buffer, vertex_buffer_memory, 0) }
+        .expect("Couldn't bind vertex buffer");
 
-    (vertex_buffer, vertex_buffer_device_memory)
+    (vertex_buffer, vertex_buffer_memory)
 }
 
 // taken from vulkan-tutorial-rust
