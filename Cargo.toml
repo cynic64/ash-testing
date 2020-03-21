@@ -1,7 +1,7 @@
 [package]
-name = "examples"
+name = "ash-testing"
 version = "0.1.0"
-authors = ["maik klein <maikklein@googlemail.com>"]
+authors = ["cynic64 <f3bl@gmx.com>"]
 edition = "2018"
 
 [dependencies]

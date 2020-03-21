@@ -6,10 +6,12 @@ use ash::{vk, vk_make_version, Entry};
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
 
 use memoffset::offset_of;
+
+use ash_testing::{get_elapsed, relative_path};
 
 const MAX_FRAMES_IN_FLIGHT: usize = 4;
 
@@ -619,8 +621,6 @@ pub fn main() {
 }
 
 fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
-    let st = std::time::Instant::now();
-
     use lyon::math::{point, Point};
     use lyon::path::Path;
     use lyon::tessellation::*;
@@ -677,8 +677,6 @@ fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
             )
             .unwrap();
     }
-
-    println!("Lyon took: {} ms", get_elapsed(st) * 1_000.0);
 
     (geometry.vertices, geometry.indices)
 }
@@ -1623,14 +1621,6 @@ fn read_shader_code(shader_path: &Path) -> Vec<u8> {
     let bytes_code: Vec<u8> = spv_file.bytes().filter_map(|byte| byte.ok()).collect();
 
     bytes_code
-}
-
-fn relative_path(local_path: &str) -> PathBuf {
-    [env!("CARGO_MANIFEST_DIR"), local_path].iter().collect()
-}
-
-fn get_elapsed(start: std::time::Instant) -> f64 {
-    start.elapsed().as_secs() as f64 + start.elapsed().subsec_nanos() as f64 / 1_000_000_000.0
 }
 
 impl MeshBuffers {

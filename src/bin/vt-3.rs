@@ -6,10 +6,12 @@ use ash::{vk, vk_make_version, Entry};
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
 
 use winit::{Event, WindowEvent};
+
+use ash_testing::relative_path;
 
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
@@ -650,8 +652,4 @@ fn read_shader_code(shader_path: &Path) -> Vec<u8> {
     let bytes_code: Vec<u8> = spv_file.bytes().filter_map(|byte| byte.ok()).collect();
 
     bytes_code
-}
-
-pub fn relative_path(local_path: &str) -> PathBuf {
-    [env!("CARGO_MANIFEST_DIR"), local_path].iter().collect()
 }

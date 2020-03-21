@@ -6,8 +6,10 @@ use ash::{vk, vk_make_version, Entry};
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
+
+use ash_testing::{get_elapsed, relative_path};
 
 const MAX_FRAMES_IN_FLIGHT: usize = 4;
 
@@ -1252,12 +1254,4 @@ fn read_shader_code(shader_path: &Path) -> Vec<u8> {
     let bytes_code: Vec<u8> = spv_file.bytes().filter_map(|byte| byte.ok()).collect();
 
     bytes_code
-}
-
-pub fn relative_path(local_path: &str) -> PathBuf {
-    [env!("CARGO_MANIFEST_DIR"), local_path].iter().collect()
-}
-
-pub fn get_elapsed(start: std::time::Instant) -> f64 {
-    start.elapsed().as_secs() as f64 + start.elapsed().subsec_nanos() as f64 / 1_000_000_000.0
 }
