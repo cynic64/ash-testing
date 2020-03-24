@@ -53,12 +53,18 @@ struct FlyingFrame {
     render_finished_semaphore: vk::Semaphore,
     render_finished_fence: vk::Fence,
     command_buffer: Option<vk::CommandBuffer>,
-    staging_buffer: vk::Buffer,
-    staging_buffer_memory: vk::DeviceMemory,
+
+    vertex_staging_buffer: vk::Buffer,
+    vertex_staging_buffer_memory: vk::DeviceMemory,
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
+    index_staging_buffer: vk::Buffer,
+    index_staging_buffer_memory: vk::DeviceMemory,
     index_buffer: vk::Buffer,
     index_buffer_memory: vk::DeviceMemory,
+
+    vbuf_copied_fence: vk::Fence,
+    ibuf_copied_fence: vk::Fence,
 }
 
 #[repr(C)]
@@ -272,7 +278,7 @@ pub fn main() {
 
     // generate mesh once for an estimate of its length
     let (vertices, indices) = create_mesh();
-    let alloc_margin = 1.1;
+    let alloc_margin = 1.2;
     let vertex_buffer_capacity = (size_of_slice(&vertices) as f32 * alloc_margin) as DeviceSize;
     let index_buffer_capacity = (size_of_slice(&indices) as f32 * alloc_margin) as DeviceSize;
 
@@ -304,13 +310,12 @@ pub fn main() {
     let device_memory_properties =
         unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
-    let (mut flying_frames, staging_buffer_capacity, vertex_buffer_capacity, index_buffer_capacity) =
-        setup_flying_frames(
-            &device,
-            device_memory_properties,
-            vertex_buffer_capacity,
-            index_buffer_capacity,
-        );
+    let mut flying_frames = setup_flying_frames(
+        &device,
+        device_memory_properties,
+        vertex_buffer_capacity,
+        index_buffer_capacity,
+    );
 
     // used to check whether rendering to a swapchain image has finished,
     // necessary because we have more sync sets than swapchain images
@@ -330,6 +335,7 @@ pub fn main() {
     let mut timer_copy_vbuf = LoopTimer::new("Copy vbuf".to_string());
     let mut timer_write_ibuf = LoopTimer::new("Write ibuf".to_string());
     let mut timer_copy_ibuf = LoopTimer::new("Copy ibuf".to_string());
+    let mut timer_copy_complete = LoopTimer::new("Copy completion".to_string());
 
     loop {
         if must_recreate_swapchain {
@@ -489,71 +495,66 @@ pub fn main() {
         let index_buffer_size = size_of_slice(&index_data);
 
         assert!(
-            vertex_buffer_size < staging_buffer_capacity,
-            "Staging buffer ({}) too small for vertex data ({})!",
-            staging_buffer_capacity,
+            vertex_buffer_size < vertex_buffer_capacity,
+            "Vertex buffers ({}) too small for vertex data ({})!",
+            vertex_buffer_capacity,
             vertex_buffer_size
         );
 
         assert!(
-            index_buffer_size < staging_buffer_capacity,
-            "Staging buffer ({}) too small for index data ({})!",
-            staging_buffer_capacity,
-            index_buffer_size
-        );
-
-        assert!(
-            vertex_buffer_size < vertex_buffer_capacity,
-            "Vertex buffer ({}) too small for vertex data ({})!",
-            vertex_buffer_size,
-            vertex_buffer_capacity,
-        );
-
-        assert!(
             index_buffer_size < index_buffer_capacity,
-            "Index buffer ({}) too small for index data ({})!",
-            index_buffer_size,
+            "Index buffers ({}) too small for index data ({})!",
             index_buffer_capacity,
+            index_buffer_size
         );
 
         // even though we modify these, we don't need to mutably borrow because
         // they are magical Vulkan pointers that don't care about lifetimes
-        let staging_buffer = flying_frames[flying_frame_idx].staging_buffer;
-        let staging_buffer_memory = flying_frames[flying_frame_idx].staging_buffer_memory;
+        let vertex_staging_buffer = flying_frames[flying_frame_idx].vertex_staging_buffer;
+        let vertex_staging_buffer_memory =
+            flying_frames[flying_frame_idx].vertex_staging_buffer_memory;
         let vertex_buffer = flying_frames[flying_frame_idx].vertex_buffer;
         let index_buffer = flying_frames[flying_frame_idx].index_buffer;
+        let index_staging_buffer = flying_frames[flying_frame_idx].index_staging_buffer;
+        let index_staging_buffer_memory =
+            flying_frames[flying_frame_idx].index_staging_buffer_memory;
 
-        // map and write vertex data to staging buffer
+        let vbuf_copied_fence = flying_frames[flying_frame_idx].vbuf_copied_fence;
+        let ibuf_copied_fence = flying_frames[flying_frame_idx].ibuf_copied_fence;
+
+        // map and write vertex data to vertex staging buffer
         timer_write_vbuf.start();
-        write_to_cpu_accessible_buffer(&device, staging_buffer_memory, &vertex_data);
+        write_to_cpu_accessible_buffer(&device, vertex_staging_buffer_memory, &vertex_data);
         timer_write_vbuf.stop();
 
         // copy staging buffer to vertex buffer
         timer_copy_vbuf.start();
-        copy_buffer(
+        let vbuf_command_buffer = copy_buffer(
             &device,
             queue,
             command_pool,
-            staging_buffer,
+            vertex_staging_buffer,
             vertex_buffer,
             vertex_buffer_size,
+            vbuf_copied_fence,
         );
         timer_copy_vbuf.stop();
 
         // map and write index data to staging buffer
         timer_write_ibuf.start();
-        write_to_cpu_accessible_buffer(&device, staging_buffer_memory, &index_data);
+        write_to_cpu_accessible_buffer(&device, index_staging_buffer_memory, &index_data);
         timer_write_ibuf.stop();
 
         // copy staging buffer to index buffer
         timer_copy_ibuf.start();
-        copy_buffer(
+        let ibuf_command_buffer = copy_buffer(
             &device,
             queue,
             command_pool,
-            staging_buffer,
+            index_staging_buffer,
             index_buffer,
             index_buffer_size,
+            ibuf_copied_fence,
         );
         timer_copy_ibuf.stop();
 
@@ -571,6 +572,23 @@ pub fn main() {
         );
 
         flying_frames[frames_drawn % MAX_FRAMES_IN_FLIGHT].command_buffer = Some(command_buffer);
+
+        timer_copy_complete.start();
+        // before we submit, wait for both copy operations to finish
+        unsafe {
+            device.wait_for_fences(&[vbuf_copied_fence, ibuf_copied_fence], true, std::u64::MAX)
+        }
+        .expect("Couldn't wait for vertex and index buffer to finish copying");
+        timer_copy_complete.stop();
+
+        // free the command buffers used to copy
+        unsafe {
+            device.free_command_buffers(command_pool, &[vbuf_command_buffer, ibuf_command_buffer])
+        };
+
+        // reset the fences used
+        unsafe { device.reset_fences(&[vbuf_copied_fence, ibuf_copied_fence]) }
+        .expect("Couldn't reset vbuf_ and ibuf_copied_fence");
 
         // submit command buffer
         let wait_semaphores = [image_available_semaphore];
@@ -646,6 +664,7 @@ pub fn main() {
     timer_copy_vbuf.print();
     timer_write_ibuf.print();
     timer_copy_ibuf.print();
+    timer_copy_complete.print();
 
     unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
 
@@ -656,13 +675,22 @@ pub fn main() {
                 device.free_command_buffers(command_pool, &[command_buffer]);
             }
 
-            device.destroy_buffer(f.staging_buffer, None);
+            device.destroy_semaphore(f.image_available_semaphore, None);
+            device.destroy_semaphore(f.render_finished_semaphore, None);
+            device.destroy_fence(f.render_finished_fence, None);
+
+            device.destroy_buffer(f.vertex_staging_buffer, None);
             device.destroy_buffer(f.vertex_buffer, None);
+            device.destroy_buffer(f.index_staging_buffer, None);
             device.destroy_buffer(f.index_buffer, None);
 
-            device.free_memory(f.staging_buffer_memory, None);
+            device.free_memory(f.vertex_staging_buffer_memory, None);
             device.free_memory(f.vertex_buffer_memory, None);
+            device.free_memory(f.index_staging_buffer_memory, None);
             device.free_memory(f.index_buffer_memory, None);
+
+            device.destroy_fence(f.vbuf_copied_fence, None);
+            device.destroy_fence(f.ibuf_copied_fence, None);
         });
 
         device.destroy_shader_module(frag_module, None);
@@ -679,12 +707,6 @@ pub fn main() {
 
         device.destroy_pipeline_layout(pipeline_layout, None);
         device.destroy_render_pass(render_pass, None);
-
-        flying_frames.iter().for_each(|f| {
-            device.destroy_semaphore(f.image_available_semaphore, None);
-            device.destroy_semaphore(f.render_finished_semaphore, None);
-            device.destroy_fence(f.render_finished_fence, None);
-        });
 
         device.destroy_command_pool(command_pool, None);
 
@@ -779,7 +801,12 @@ fn copy_buffer<D: DeviceV1_0>(
     source: vk::Buffer,
     dest: vk::Buffer,
     bytes: DeviceSize,
-) {
+    fence: vk::Fence,
+) -> vk::CommandBuffer {
+    // returns the command buffer used to perform the copy operation, which
+    // should be freed after the given fence is signalled
+
+    // fence will be signalled when the copy operation finishes
     let command_buffer_alloc_info = vk::CommandBufferAllocateInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
         p_next: ptr::null(),
@@ -830,12 +857,10 @@ fn copy_buffer<D: DeviceV1_0>(
         p_signal_semaphores: ptr::null(),
     }];
 
-    unsafe { device.queue_submit(queue, &submit_info, vk::Fence::null()) }
+    unsafe { device.queue_submit(queue, &submit_info, fence) }
         .expect("Couldn't submit command buffer");
 
-    unsafe { device.queue_wait_idle(queue) }.expect("Couldn't wait for queue to become idle");
-
-    unsafe { device.free_command_buffers(command_pool, &command_buffers) };
+    command_buffer
 }
 
 fn create_buffer<D: DeviceV1_0>(
@@ -1194,9 +1219,7 @@ fn setup_flying_frames<D: DeviceV1_0>(
     device_memory_properties: vk::PhysicalDeviceMemoryProperties,
     vertex_buffer_capacity: DeviceSize,
     index_buffer_capacity: DeviceSize,
-) -> (Vec<FlyingFrame>, DeviceSize, DeviceSize, DeviceSize) {
-    // (flying_frames, staging capacity, vbuf capacity, ibuf capacity
-
+) -> Vec<FlyingFrame> {
     // create info for semaphores and fences
     let semaphore_info = vk::SemaphoreCreateInfo {
         s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
@@ -1204,23 +1227,32 @@ fn setup_flying_frames<D: DeviceV1_0>(
         flags: vk::SemaphoreCreateFlags::empty(),
     };
 
-    let fence_info = vk::FenceCreateInfo {
+    let unsignalled_fence_info = vk::FenceCreateInfo {
+        s_type: vk::StructureType::FENCE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::FenceCreateFlags::empty(),
+    };
+
+    let signalled_fence_info = vk::FenceCreateInfo {
         s_type: vk::StructureType::FENCE_CREATE_INFO,
         p_next: ptr::null(),
         flags: vk::FenceCreateFlags::SIGNALED,
     };
 
-    // size of the staging buffer, it must fit both the vertex and index data
-    let staging_buffer_size = std::cmp::max(vertex_buffer_capacity, index_buffer_capacity);
-
-    let flying_frames: Vec<_> = (0..MAX_FRAMES_IN_FLIGHT)
+    (0..MAX_FRAMES_IN_FLIGHT)
         .map(|_| {
-            // create a staging buffer, staging buffer device memory, vertex
-            // buffer and vertex buffer device memory for each frame
-            let (staging_buffer, staging_buffer_memory) = create_buffer(
+            let (vertex_staging_buffer, vertex_staging_buffer_memory) = create_buffer(
                 device,
                 device_memory_properties,
-                staging_buffer_size,
+                vertex_buffer_capacity,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
+
+            let (index_staging_buffer, index_staging_buffer_memory) = create_buffer(
+                device,
+                device_memory_properties,
+                index_buffer_capacity,
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             );
@@ -1241,34 +1273,43 @@ fn setup_flying_frames<D: DeviceV1_0>(
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             );
 
+            let image_available_semaphore =
+                unsafe { device.create_semaphore(&semaphore_info, None) }
+                    .expect("Couldn't create semaphore");
+
+            let render_finished_semaphore =
+                unsafe { device.create_semaphore(&semaphore_info, None) }
+                    .expect("Couldn't create semaphore");
+
+            let render_finished_fence = unsafe { device.create_fence(&signalled_fence_info, None) }
+                .expect("Couldn't create fence");
+
+            let vbuf_copied_fence = unsafe { device.create_fence(&unsignalled_fence_info, None) }
+                .expect("Couldn't create fence");
+
+            let ibuf_copied_fence = unsafe { device.create_fence(&unsignalled_fence_info, None) }
+                .expect("Couldn't create fence");
+
             FlyingFrame {
-                image_available_semaphore: unsafe {
-                    device.create_semaphore(&semaphore_info, None)
-                }
-                .expect("Couldn't create semaphore"),
-                render_finished_semaphore: unsafe {
-                    device.create_semaphore(&semaphore_info, None)
-                }
-                .expect("Couldn't create semaphore"),
-                render_finished_fence: unsafe { device.create_fence(&fence_info, None) }
-                    .expect("Couldn't create fence"),
+                image_available_semaphore,
+                render_finished_semaphore,
+                render_finished_fence,
                 command_buffer: None,
-                staging_buffer,
-                staging_buffer_memory,
+
+                vertex_staging_buffer,
+                vertex_staging_buffer_memory,
                 vertex_buffer,
                 vertex_buffer_memory,
+                index_staging_buffer,
+                index_staging_buffer_memory,
                 index_buffer,
                 index_buffer_memory,
+
+                vbuf_copied_fence,
+                ibuf_copied_fence,
             }
         })
-        .collect();
-
-    (
-        flying_frames,
-        staging_buffer_size,
-        vertex_buffer_capacity,
-        index_buffer_capacity,
-    )
+        .collect()
 }
 
 fn create_command_pool<D: DeviceV1_0>(device: &D, queue_family_index: u32) -> vk::CommandPool {
