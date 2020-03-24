@@ -1,6 +1,7 @@
 use ash::extensions::khr::{Swapchain, XlibSurface};
 use ash::extensions::{ext::DebugUtils, khr::Surface};
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
+use ash::vk::DeviceSize;
 use ash::{vk, vk_make_version, Entry};
 
 use std::convert::TryInto;
@@ -11,7 +12,7 @@ use std::ptr;
 
 use memoffset::offset_of;
 
-use ash_testing::{get_elapsed, relative_path, LoopTimer};
+use ash_testing::{get_elapsed, relative_path, size_of_slice, LoopTimer};
 
 const MAX_FRAMES_IN_FLIGHT: usize = 4;
 
@@ -39,6 +40,8 @@ use winit::{Event, WindowEvent};
 
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
+type IndexType = u32;
+
 // we cannot know which image will be used before calling acquire_next_image,
 // for which we already need a semaphore ready for it to signal.
 
@@ -50,10 +53,8 @@ struct FlyingFrame {
     render_finished_semaphore: vk::Semaphore,
     render_finished_fence: vk::Fence,
     command_buffer: Option<vk::CommandBuffer>,
-    mesh_buffers: Option<MeshBuffers>,
-}
-
-struct MeshBuffers {
+    staging_buffer: vk::Buffer,
+    staging_buffer_memory: vk::DeviceMemory,
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
     index_buffer: vk::Buffer,
@@ -269,9 +270,11 @@ pub fn main() {
     // command pool
     let command_pool = create_command_pool(&device, queue_family_index);
 
-    // vbuf / ibuf creation
-    let device_memory_properties =
-        unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    // generate mesh once for an estimate of its length
+    let (vertices, indices) = create_mesh();
+    let alloc_margin = 1.1;
+    let vertex_buffer_capacity = (size_of_slice(&vertices) as f32 * alloc_margin) as DeviceSize;
+    let index_buffer_capacity = (size_of_slice(&indices) as f32 * alloc_margin) as DeviceSize;
 
     // render pass
     let render_pass = create_render_pass(&device);
@@ -298,7 +301,16 @@ pub fn main() {
         create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
 
     // flying frames (one for each swapchain image)
-    let mut flying_frames = create_flying_frames(&device);
+    let device_memory_properties =
+        unsafe { instance.get_physical_device_memory_properties(physical_device) };
+
+    let (mut flying_frames, staging_buffer_capacity, vertex_buffer_capacity, index_buffer_capacity) =
+        setup_flying_frames(
+            &device,
+            device_memory_properties,
+            vertex_buffer_capacity,
+            index_buffer_capacity,
+        );
 
     // used to check whether rendering to a swapchain image has finished,
     // necessary because we have more sync sets than swapchain images
@@ -313,8 +325,11 @@ pub fn main() {
 
     // timers
     let mut timer_mesh_gen = LoopTimer::new("Mesh generation".to_string());
-    let mut timer_create_buffers = LoopTimer::new("Buffer creation".to_string());
     let mut timer_draw = LoopTimer::new("Drawing".to_string());
+    let mut timer_write_vbuf = LoopTimer::new("Write vbuf".to_string());
+    let mut timer_copy_vbuf = LoopTimer::new("Copy vbuf".to_string());
+    let mut timer_write_ibuf = LoopTimer::new("Write ibuf".to_string());
+    let mut timer_copy_ibuf = LoopTimer::new("Copy ibuf".to_string());
 
     loop {
         if must_recreate_swapchain {
@@ -386,7 +401,8 @@ pub fn main() {
             break;
         }
 
-        let frame = &flying_frames[frames_drawn % MAX_FRAMES_IN_FLIGHT];
+        let flying_frame_idx = frames_drawn % MAX_FRAMES_IN_FLIGHT;
+        let frame = &flying_frames[flying_frame_idx];
 
         let image_available_semaphore = frame.image_available_semaphore;
         let render_finished_semaphore = frame.render_finished_semaphore;
@@ -409,16 +425,6 @@ pub fn main() {
                     "No command buffer in flying frame on frame {}",
                     frames_drawn
                 );
-            }
-        }
-
-        // we can also now destroy the previously created vertex and index
-        // buffers
-        if let Some(mesh_buffers) = &frame.mesh_buffers {
-            unsafe { mesh_buffers.destroy(&device) };
-        } else {
-            if frames_drawn >= MAX_FRAMES_IN_FLIGHT {
-                panic!("No mesh buffers in flying frame on frame {}", frames_drawn);
             }
         }
 
@@ -471,39 +477,85 @@ pub fn main() {
         let (vertex_data, index_data) = create_mesh();
         timer_mesh_gen.stop();
 
-        timer_create_buffers.start();
-
-        let (vertex_buffer, vertex_buffer_memory) = create_device_local_buffer(
-            &device,
-            queue,
-            command_pool,
-            device_memory_properties,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            &vertex_data,
-        );
-
-        let (index_buffer, index_buffer_memory) = create_device_local_buffer(
-            &device,
-            queue,
-            command_pool,
-            device_memory_properties,
-            vk::BufferUsageFlags::INDEX_BUFFER,
-            &index_data,
-        );
-
-        timer_create_buffers.stop();
-
-        flying_frames[frames_drawn % MAX_FRAMES_IN_FLIGHT].mesh_buffers = Some(MeshBuffers {
-            vertex_buffer,
-            vertex_buffer_memory,
-            index_buffer,
-            index_buffer_memory,
-        });
-
         // set the render_finished_fence associated with this swapchain image to
         // the fence that will be signalled when we finish rendering - in other
         // words, "We're using this image! Don't touch it till we finish."
         swapchain_fences[image_idx as usize] = Some(render_finished_fence);
+
+        // change mesh data on GPU
+
+        // make sure we won't go past the memory we've allocated
+        let vertex_buffer_size = size_of_slice(&vertex_data);
+        let index_buffer_size = size_of_slice(&index_data);
+
+        assert!(
+            vertex_buffer_size < staging_buffer_capacity,
+            "Staging buffer ({}) too small for vertex data ({})!",
+            staging_buffer_capacity,
+            vertex_buffer_size
+        );
+
+        assert!(
+            index_buffer_size < staging_buffer_capacity,
+            "Staging buffer ({}) too small for index data ({})!",
+            staging_buffer_capacity,
+            index_buffer_size
+        );
+
+        assert!(
+            vertex_buffer_size < vertex_buffer_capacity,
+            "Vertex buffer ({}) too small for vertex data ({})!",
+            vertex_buffer_size,
+            vertex_buffer_capacity,
+        );
+
+        assert!(
+            index_buffer_size < index_buffer_capacity,
+            "Index buffer ({}) too small for index data ({})!",
+            index_buffer_size,
+            index_buffer_capacity,
+        );
+
+        // even though we modify these, we don't need to mutably borrow because
+        // they are magical Vulkan pointers that don't care about lifetimes
+        let staging_buffer = flying_frames[flying_frame_idx].staging_buffer;
+        let staging_buffer_memory = flying_frames[flying_frame_idx].staging_buffer_memory;
+        let vertex_buffer = flying_frames[flying_frame_idx].vertex_buffer;
+        let index_buffer = flying_frames[flying_frame_idx].index_buffer;
+
+        // map and write vertex data to staging buffer
+        timer_write_vbuf.start();
+        write_to_cpu_accessible_buffer(&device, staging_buffer_memory, &vertex_data);
+        timer_write_vbuf.stop();
+
+        // copy staging buffer to vertex buffer
+        timer_copy_vbuf.start();
+        copy_buffer(
+            &device,
+            queue,
+            command_pool,
+            staging_buffer,
+            vertex_buffer,
+            vertex_buffer_size,
+        );
+        timer_copy_vbuf.stop();
+
+        // map and write index data to staging buffer
+        timer_write_ibuf.start();
+        write_to_cpu_accessible_buffer(&device, staging_buffer_memory, &index_data);
+        timer_write_ibuf.stop();
+
+        // copy staging buffer to index buffer
+        timer_copy_ibuf.start();
+        copy_buffer(
+            &device,
+            queue,
+            command_pool,
+            staging_buffer,
+            index_buffer,
+            index_buffer_size,
+        );
+        timer_copy_ibuf.stop();
 
         // create command buffer
         let command_buffer = create_command_buffer(
@@ -589,8 +641,11 @@ pub fn main() {
     );
 
     timer_draw.print();
-    timer_create_buffers.print();
     timer_mesh_gen.print();
+    timer_write_vbuf.print();
+    timer_copy_vbuf.print();
+    timer_write_ibuf.print();
+    timer_copy_ibuf.print();
 
     unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
 
@@ -601,9 +656,13 @@ pub fn main() {
                 device.free_command_buffers(command_pool, &[command_buffer]);
             }
 
-            if let Some(mesh_buffers) = &f.mesh_buffers {
-                mesh_buffers.destroy(&device);
-            }
+            device.destroy_buffer(f.staging_buffer, None);
+            device.destroy_buffer(f.vertex_buffer, None);
+            device.destroy_buffer(f.index_buffer, None);
+
+            device.free_memory(f.staging_buffer_memory, None);
+            device.free_memory(f.vertex_buffer_memory, None);
+            device.free_memory(f.index_buffer_memory, None);
         });
 
         device.destroy_shader_module(frag_module, None);
@@ -639,7 +698,7 @@ pub fn main() {
     }
 }
 
-fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
+fn create_mesh() -> (Vec<Vertex>, Vec<IndexType>) {
     use lyon::math::{point, Point};
     use lyon::path::Path;
     use lyon::tessellation::*;
@@ -664,16 +723,11 @@ fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
     builder.quadratic_bezier_to(point(0.0, 0.0), point(-1.0, 1.0));
     builder.line_to(point((x * PI * 0.5).sin(), (x * PI * 0.5).cos()));
     builder.quadratic_bezier_to(point(0.0, 0.0), point(1.0, 1.0));
-    /*
-    builder.quadratic_bezier_to(point(2.0, 0.0), point(2.0, 1.0));
-    builder.cubic_bezier_to(point(1.0, 1.0), point(0.0, 1.0), point(0.0, 0.0));
-    builder.close();
-    */
 
     let path = builder.build();
 
     // Will contain the result of the tessellation.
-    let mut geometry: VertexBuffers<Vertex, u32> = VertexBuffers::new();
+    let mut geometry: VertexBuffers<Vertex, IndexType> = VertexBuffers::new();
     let mut tessellator = StrokeTessellator::new();
     {
         // Compute the tessellation.
@@ -700,69 +754,22 @@ fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
     (geometry.vertices, geometry.indices)
 }
 
-fn create_device_local_buffer<D: DeviceV1_0, T>(
+fn write_to_cpu_accessible_buffer<D: DeviceV1_0, T>(
     device: &D,
-    queue: vk::Queue,
-    command_pool: vk::CommandPool,
-    device_memory_properties: vk::PhysicalDeviceMemoryProperties,
-    usage: vk::BufferUsageFlags,
+    buffer_memory: vk::DeviceMemory,
     data: &[T],
-) -> (vk::Buffer, vk::DeviceMemory) {
-    // TRANSFER_DST will be added to usage, you don't have to include it
-
-    let buffer_size = (std::mem::size_of::<T>() * data.len()) as u64;
-
-    // first we copy the data from the CPU to a GPU buffer visible to the CPU
-    // (which would be slower for the GPU to use if we went on to use it as a
-    // vertex buffer), then we copy from that GPU buffer into another GPU buffer
-    // that is only visible to the GPU, which is faster to use as a vertex
-    // buffer but cannot be directly copied into by the CPU.
-    let (staging_buffer, staging_buffer_memory) = create_buffer(
-        device,
-        device_memory_properties,
-        buffer_size,
-        vk::BufferUsageFlags::TRANSFER_SRC,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    );
+) {
+    let buffer_size = size_of_slice(data);
 
     unsafe {
         let mapped_memory = device
-            .map_memory(
-                staging_buffer_memory,
-                0,
-                buffer_size,
-                vk::MemoryMapFlags::empty(),
-            )
+            .map_memory(buffer_memory, 0, buffer_size, vk::MemoryMapFlags::empty())
             .expect("Couldn't map vertex buffer memory") as *mut T;
 
         mapped_memory.copy_from_nonoverlapping(data.as_ptr(), data.len());
 
-        device.unmap_memory(staging_buffer_memory);
+        device.unmap_memory(buffer_memory);
     }
-
-    let (buffer, buffer_memory) = create_buffer(
-        device,
-        device_memory_properties,
-        buffer_size,
-        usage | vk::BufferUsageFlags::TRANSFER_DST,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    );
-
-    copy_buffer(
-        device,
-        queue,
-        command_pool,
-        staging_buffer,
-        buffer,
-        buffer_size,
-    );
-
-    unsafe {
-        device.destroy_buffer(staging_buffer, None);
-        device.free_memory(staging_buffer_memory, None);
-    }
-
-    (buffer, buffer_memory)
 }
 
 fn copy_buffer<D: DeviceV1_0>(
@@ -771,7 +778,7 @@ fn copy_buffer<D: DeviceV1_0>(
     command_pool: vk::CommandPool,
     source: vk::Buffer,
     dest: vk::Buffer,
-    bytes: u64,
+    bytes: DeviceSize,
 ) {
     let command_buffer_alloc_info = vk::CommandBufferAllocateInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
@@ -834,7 +841,7 @@ fn copy_buffer<D: DeviceV1_0>(
 fn create_buffer<D: DeviceV1_0>(
     device: &D,
     device_memory_properties: vk::PhysicalDeviceMemoryProperties,
-    bytes: u64,
+    bytes: DeviceSize,
     usage: vk::BufferUsageFlags,
     required_memory_properties: vk::MemoryPropertyFlags,
 ) -> (vk::Buffer, vk::DeviceMemory) {
@@ -1182,7 +1189,15 @@ fn cleanup_swapchain<D: DeviceV1_0>(
     }
 }
 
-fn create_flying_frames<D: DeviceV1_0>(device: &D) -> Vec<FlyingFrame> {
+fn setup_flying_frames<D: DeviceV1_0>(
+    device: &D,
+    device_memory_properties: vk::PhysicalDeviceMemoryProperties,
+    vertex_buffer_capacity: DeviceSize,
+    index_buffer_capacity: DeviceSize,
+) -> (Vec<FlyingFrame>, DeviceSize, DeviceSize, DeviceSize) {
+    // (flying_frames, staging capacity, vbuf capacity, ibuf capacity
+
+    // create info for semaphores and fences
     let semaphore_info = vk::SemaphoreCreateInfo {
         s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
         p_next: ptr::null(),
@@ -1195,18 +1210,65 @@ fn create_flying_frames<D: DeviceV1_0>(device: &D) -> Vec<FlyingFrame> {
         flags: vk::FenceCreateFlags::SIGNALED,
     };
 
-    (0..MAX_FRAMES_IN_FLIGHT)
-        .map(|_| FlyingFrame {
-            image_available_semaphore: unsafe { device.create_semaphore(&semaphore_info, None) }
+    // size of the staging buffer, it must fit both the vertex and index data
+    let staging_buffer_size = std::cmp::max(vertex_buffer_capacity, index_buffer_capacity);
+
+    let flying_frames: Vec<_> = (0..MAX_FRAMES_IN_FLIGHT)
+        .map(|_| {
+            // create a staging buffer, staging buffer device memory, vertex
+            // buffer and vertex buffer device memory for each frame
+            let (staging_buffer, staging_buffer_memory) = create_buffer(
+                device,
+                device_memory_properties,
+                staging_buffer_size,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            );
+
+            let (vertex_buffer, vertex_buffer_memory) = create_buffer(
+                device,
+                device_memory_properties,
+                vertex_buffer_capacity,
+                vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            );
+
+            let (index_buffer, index_buffer_memory) = create_buffer(
+                device,
+                device_memory_properties,
+                index_buffer_capacity,
+                vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            );
+
+            FlyingFrame {
+                image_available_semaphore: unsafe {
+                    device.create_semaphore(&semaphore_info, None)
+                }
                 .expect("Couldn't create semaphore"),
-            render_finished_semaphore: unsafe { device.create_semaphore(&semaphore_info, None) }
+                render_finished_semaphore: unsafe {
+                    device.create_semaphore(&semaphore_info, None)
+                }
                 .expect("Couldn't create semaphore"),
-            render_finished_fence: unsafe { device.create_fence(&fence_info, None) }
-                .expect("Couldn't create fence"),
-            command_buffer: None,
-            mesh_buffers: None,
+                render_finished_fence: unsafe { device.create_fence(&fence_info, None) }
+                    .expect("Couldn't create fence"),
+                command_buffer: None,
+                staging_buffer,
+                staging_buffer_memory,
+                vertex_buffer,
+                vertex_buffer_memory,
+                index_buffer,
+                index_buffer_memory,
+            }
         })
-        .collect()
+        .collect();
+
+    (
+        flying_frames,
+        staging_buffer_size,
+        vertex_buffer_capacity,
+        index_buffer_capacity,
+    )
 }
 
 fn create_command_pool<D: DeviceV1_0>(device: &D, queue_family_index: u32) -> vk::CommandPool {
@@ -1640,16 +1702,4 @@ fn read_shader_code(shader_path: &Path) -> Vec<u8> {
     let bytes_code: Vec<u8> = spv_file.bytes().filter_map(|byte| byte.ok()).collect();
 
     bytes_code
-}
-
-impl MeshBuffers {
-    unsafe fn destroy<D: DeviceV1_0>(&self, device: &D) {
-        // unsafe because we destroy the Buffers and DeviceMemorys but keep the
-        // references to them in Self
-
-        device.destroy_buffer(self.vertex_buffer, None);
-        device.free_memory(self.vertex_buffer_memory, None);
-        device.destroy_buffer(self.index_buffer, None);
-        device.free_memory(self.index_buffer_memory, None);
-    }
 }

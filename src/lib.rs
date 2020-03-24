@@ -8,6 +8,10 @@ pub fn get_elapsed(start: std::time::Instant) -> f64 {
     start.elapsed().as_secs() as f64 + start.elapsed().subsec_nanos() as f64 / 1_000_000_000.0
 }
 
+pub fn size_of_slice<T>(slice: &[T]) -> u64 {
+    (std::mem::size_of::<T>() * slice.len()) as u64
+}
+
 // a timer that can be started and stopped many times and can print the average
 // timed duration, useful for averaging durations across loop iterations
 pub struct LoopTimer {
@@ -29,7 +33,10 @@ impl LoopTimer {
 
     pub fn start(&mut self) {
         match self.last_start {
-            Some(_) => panic!("Start called on already started LoopTimer (name {})", self.name),
+            Some(_) => panic!(
+                "Start called on already started LoopTimer (name {})",
+                self.name
+            ),
             None => self.last_start = Some(std::time::Instant::now()),
         }
     }
