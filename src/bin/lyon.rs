@@ -4,6 +4,9 @@ use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
 use ash::vk::DeviceSize;
 use ash::{vk, vk_make_version, Entry};
 
+use winit::dpi::LogicalPosition;
+use winit::{ElementState, Event, MouseButton, WindowEvent};
+
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
 use std::convert::TryInto;
@@ -38,13 +41,17 @@ use objc::runtime::YES;
 #[cfg(target_os = "macos")]
 use std::mem;
 
-use winit::{Event, WindowEvent};
-
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
 type IndexType = u32;
 
 const MESH_CHANNEL_CAPACITY: usize = 8;
+
+// range from 0.0 .. screen size
+type PixelPos = [f64; 2];
+
+// -1.0 .. 1.0
+type VkPos = [f64; 2];
 
 // we cannot know which image will be used before calling acquire_next_image,
 // for which we already need a semaphore ready for it to signal.
@@ -90,6 +97,7 @@ pub fn main() {
         .with_title("Ash - Example")
         .build(&events_loop)
         .unwrap();
+    let hidpi_factor = window.get_hidpi_factor();
 
     // create instance
     let app_info = vk::ApplicationInfo {
@@ -285,12 +293,11 @@ pub fn main() {
     // command pool
     let command_pool = create_command_pool(&device, queue_family_index);
 
-    // generate mesh once for an estimate of its length
-    let mesh = create_mesh();
-    let alloc_margin = 1.2;
-    let vertex_buffer_capacity =
-        (size_of_slice(&mesh.vertices) as f32 * alloc_margin) as DeviceSize;
-    let index_buffer_capacity = (size_of_slice(&mesh.indices) as f32 * alloc_margin) as DeviceSize;
+    // mesh allocation sizes
+    let est_vertices = 100_000;
+    let est_indices = 200_000;
+    let vertex_buffer_capacity = (est_vertices * std::mem::size_of::<Vertex>()) as DeviceSize;
+    let index_buffer_capacity = (est_indices * std::mem::size_of::<IndexType>()) as DeviceSize;
 
     // render pass
     let render_pass = create_render_pass(&device);
@@ -340,9 +347,20 @@ pub fn main() {
 
     // start the mesh generating thread (will constantly create new mesh data
     // and send it to the rendering thread across a channel)
+
+    // the spawned thread will send us new meshes
     let (mesh_send, mesh_recv): (Sender<Mesh>, Receiver<Mesh>) =
         crossbeam_channel::bounded(MESH_CHANNEL_CAPACITY);
-    let mesh_gen_handle = std::thread::spawn(move || mesh_thread(mesh_send));
+    // and we will send it mouse click locations (unbounded because rendering is
+    // usually faster and multiple clicks can be processed by the meshing thread
+    // in one iteration)
+    let (click_send, click_recv): (Sender<VkPos>, Receiver<VkPos>) = crossbeam_channel::unbounded();
+    // spawn it
+    let mesh_gen_handle = std::thread::spawn(move || mesh_thread(mesh_send, click_recv));
+
+    // winit does not have a function to get the current mouse position, so
+    // instead we keep track of it and update it every time the mouse moves
+    let mut mouse_pos = [0.0, 0.0];
 
     // timers
     let mut timer_mesh_wait = LoopTimer::new("Waiting on mesh gen".to_string());
@@ -416,6 +434,27 @@ pub fn main() {
                 event: WindowEvent::CloseRequested,
                 ..
             } => exit = true,
+            Event::WindowEvent {
+                event:
+                    WindowEvent::CursorMoved {
+                        position: LogicalPosition { x, y },
+                        ..
+                    },
+                ..
+            } => mouse_pos = [x * hidpi_factor, y * hidpi_factor],
+            Event::WindowEvent {
+                event:
+                    WindowEvent::MouseInput {
+                        state: ElementState::Pressed,
+                        button: MouseButton::Left,
+                        ..
+                    },
+                ..
+            } => {
+                click_send
+                    .send(pixel_to_vk(swapchain_dims, mouse_pos))
+                    .unwrap();
+            }
             _ => {}
         });
 
@@ -495,7 +534,6 @@ pub fn main() {
 
         timer_draw.stop();
 
-        dbg![mesh_recv.len()];
         timer_mesh_wait.start();
         let mesh = mesh_recv.recv().expect("Error when receiving mesh");
         timer_mesh_wait.stop();
@@ -742,15 +780,19 @@ pub fn main() {
     mesh_gen_handle.join().unwrap();
 }
 
-fn mesh_thread(send: Sender<Mesh>) {
+fn mesh_thread(mesh_send: Sender<Mesh>, click_recv: Receiver<VkPos>) {
     let mut timer = LoopTimer::new("Mesh generation".to_string());
+
+    let mut points = vec![];
 
     loop {
         timer.start();
 
-        let mesh = create_mesh();
+        click_recv.try_iter().for_each(|pos| points.push(pos));
 
-        match send.try_send(mesh) {
+        let mesh = create_mesh(&points);
+
+        match mesh_send.try_send(mesh) {
             Ok(_) => {}
             Err(TrySendError::Disconnected(_)) => {
                 println!("Mesh receiver disconnected, mesh gen thread quitting");
@@ -767,23 +809,16 @@ fn mesh_thread(send: Sender<Mesh>) {
     }
 }
 
-fn create_mesh() -> Mesh {
+fn create_mesh(points: &[VkPos]) -> Mesh {
     use lyon::math::{point, Point};
     use lyon::path::Path;
     use lyon::tessellation::*;
     use lyon_tessellation::{LineCap, StrokeOptions, StrokeTessellator};
-    use std::f32::consts::PI;
-
-    let elapsed = std::time::UNIX_EPOCH.elapsed().unwrap();
-    let secs = elapsed.as_secs() as f64;
-    let millis = elapsed.subsec_millis() as f64 / 1_000.0;
-    let time = secs + millis;
-
-    let x = (time % 4.0) as f32;
 
     let mut builder = Path::builder();
 
     builder.move_to(point(0.0, 0.0));
+    /*
     builder.line_to(point((x * PI * 0.5).sin(), (x * PI * 0.5).cos()));
     builder.quadratic_bezier_to(point(0.0, 0.0), point(-1.0, -1.0));
     builder.line_to(point((x * PI * 0.5).sin(), (x * PI * 0.5).cos()));
@@ -792,14 +827,18 @@ fn create_mesh() -> Mesh {
     builder.quadratic_bezier_to(point(0.0, 0.0), point(-1.0, 1.0));
     builder.line_to(point((x * PI * 0.5).sin(), (x * PI * 0.5).cos()));
     builder.quadratic_bezier_to(point(0.0, 0.0), point(1.0, 1.0));
+     */
+    points.iter().for_each(|pos| {
+        builder.line_to(point(pos[0] as f32, pos[1] as f32));
+    });
 
     let path = builder.build();
 
-    // Will contain the result of the tessellation.
+    // will contain the result of the tessellation.
     let mut geometry: VertexBuffers<Vertex, IndexType> = VertexBuffers::new();
     let mut tessellator = StrokeTessellator::new();
     {
-        // Compute the tessellation.
+        // compute the tessellation.
         tessellator
             .tessellate(
                 &path,
@@ -1793,4 +1832,14 @@ fn read_shader_code(shader_path: &Path) -> Vec<u8> {
     let bytes_code: Vec<u8> = spv_file.bytes().filter_map(|byte| byte.ok()).collect();
 
     bytes_code
+}
+
+fn pixel_to_vk(screen_dims: vk::Extent2D, pixel_pos: PixelPos) -> VkPos {
+    let screen_width = screen_dims.width as f64;
+    let screen_height = screen_dims.height as f64;
+
+    [
+        (pixel_pos[0] - screen_width * 0.5) / screen_width * 2.0,
+        (pixel_pos[1] - screen_height * 0.5) / screen_height * 2.0,
+    ]
 }
