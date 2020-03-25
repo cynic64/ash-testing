@@ -4,6 +4,8 @@ use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
 use ash::vk::DeviceSize;
 use ash::{vk, vk_make_version, Entry};
 
+use crossbeam_channel::{Receiver, Sender, TrySendError};
+
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
@@ -42,6 +44,8 @@ const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
 type IndexType = u32;
 
+const MESH_CHANNEL_CAPACITY: usize = 8;
+
 // we cannot know which image will be used before calling acquire_next_image,
 // for which we already need a semaphore ready for it to signal.
 
@@ -72,6 +76,11 @@ struct FlyingFrame {
 struct Vertex {
     position: [f32; 2],
     color: [f32; 3],
+}
+
+struct Mesh {
+    vertices: Vec<Vertex>,
+    indices: Vec<IndexType>,
 }
 
 pub fn main() {
@@ -277,10 +286,11 @@ pub fn main() {
     let command_pool = create_command_pool(&device, queue_family_index);
 
     // generate mesh once for an estimate of its length
-    let (vertices, indices) = create_mesh();
+    let mesh = create_mesh();
     let alloc_margin = 1.2;
-    let vertex_buffer_capacity = (size_of_slice(&vertices) as f32 * alloc_margin) as DeviceSize;
-    let index_buffer_capacity = (size_of_slice(&indices) as f32 * alloc_margin) as DeviceSize;
+    let vertex_buffer_capacity =
+        (size_of_slice(&mesh.vertices) as f32 * alloc_margin) as DeviceSize;
+    let index_buffer_capacity = (size_of_slice(&mesh.indices) as f32 * alloc_margin) as DeviceSize;
 
     // render pass
     let render_pass = create_render_pass(&device);
@@ -328,8 +338,14 @@ pub fn main() {
 
     let mut must_recreate_swapchain = false;
 
+    // start the mesh generating thread (will constantly create new mesh data
+    // and send it to the rendering thread across a channel)
+    let (mesh_send, mesh_recv): (Sender<Mesh>, Receiver<Mesh>) =
+        crossbeam_channel::bounded(MESH_CHANNEL_CAPACITY);
+    let mesh_gen_handle = std::thread::spawn(move || mesh_thread(mesh_send));
+
     // timers
-    let mut timer_mesh_gen = LoopTimer::new("Mesh generation".to_string());
+    let mut timer_mesh_wait = LoopTimer::new("Waiting on mesh gen".to_string());
     let mut timer_draw = LoopTimer::new("Drawing".to_string());
     let mut timer_write_vbuf = LoopTimer::new("Write vbuf".to_string());
     let mut timer_copy_vbuf = LoopTimer::new("Copy vbuf".to_string());
@@ -479,9 +495,10 @@ pub fn main() {
 
         timer_draw.stop();
 
-        timer_mesh_gen.start();
-        let (vertex_data, index_data) = create_mesh();
-        timer_mesh_gen.stop();
+        dbg![mesh_recv.len()];
+        timer_mesh_wait.start();
+        let mesh = mesh_recv.recv().expect("Error when receiving mesh");
+        timer_mesh_wait.stop();
 
         // set the render_finished_fence associated with this swapchain image to
         // the fence that will be signalled when we finish rendering - in other
@@ -491,8 +508,8 @@ pub fn main() {
         // change mesh data on GPU
 
         // make sure we won't go past the memory we've allocated
-        let vertex_buffer_size = size_of_slice(&vertex_data);
-        let index_buffer_size = size_of_slice(&index_data);
+        let vertex_buffer_size = size_of_slice(&mesh.vertices);
+        let index_buffer_size = size_of_slice(&mesh.indices);
 
         assert!(
             vertex_buffer_size < vertex_buffer_capacity,
@@ -524,7 +541,7 @@ pub fn main() {
 
         // map and write vertex data to vertex staging buffer
         timer_write_vbuf.start();
-        write_to_cpu_accessible_buffer(&device, vertex_staging_buffer_memory, &vertex_data);
+        write_to_cpu_accessible_buffer(&device, vertex_staging_buffer_memory, &mesh.vertices);
         timer_write_vbuf.stop();
 
         // copy staging buffer to vertex buffer
@@ -542,7 +559,7 @@ pub fn main() {
 
         // map and write index data to staging buffer
         timer_write_ibuf.start();
-        write_to_cpu_accessible_buffer(&device, index_staging_buffer_memory, &index_data);
+        write_to_cpu_accessible_buffer(&device, index_staging_buffer_memory, &mesh.indices);
         timer_write_ibuf.stop();
 
         // copy staging buffer to index buffer
@@ -568,7 +585,7 @@ pub fn main() {
             swapchain_dims,
             vertex_buffer,
             index_buffer,
-            index_data.len() as u32,
+            mesh.indices.len() as u32,
         );
 
         flying_frames[frames_drawn % MAX_FRAMES_IN_FLIGHT].command_buffer = Some(command_buffer);
@@ -588,7 +605,7 @@ pub fn main() {
 
         // reset the fences used
         unsafe { device.reset_fences(&[vbuf_copied_fence, ibuf_copied_fence]) }
-        .expect("Couldn't reset vbuf_ and ibuf_copied_fence");
+            .expect("Couldn't reset vbuf_ and ibuf_copied_fence");
 
         // submit command buffer
         let wait_semaphores = [image_available_semaphore];
@@ -652,6 +669,8 @@ pub fn main() {
         frames_drawn += 1;
     }
 
+    drop(mesh_recv);
+
     println!("FPS: {:.2}", frames_drawn as f64 / get_elapsed(start_time));
     println!(
         "Average delta in ms: {:.5}",
@@ -659,7 +678,7 @@ pub fn main() {
     );
 
     timer_draw.print();
-    timer_mesh_gen.print();
+    timer_mesh_wait.print();
     timer_write_vbuf.print();
     timer_copy_vbuf.print();
     timer_write_ibuf.print();
@@ -718,9 +737,37 @@ pub fn main() {
 
         instance.destroy_instance(None);
     }
+
+    println!("waiting on mesh thread");
+    mesh_gen_handle.join().unwrap();
 }
 
-fn create_mesh() -> (Vec<Vertex>, Vec<IndexType>) {
+fn mesh_thread(send: Sender<Mesh>) {
+    let mut timer = LoopTimer::new("Mesh generation".to_string());
+
+    loop {
+        timer.start();
+
+        let mesh = create_mesh();
+
+        match send.try_send(mesh) {
+            Ok(_) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                println!("Mesh receiver disconnected, mesh gen thread quitting");
+                timer.print();
+                return;
+            }
+            Err(TrySendError::Full(_)) => eprintln!(
+                "Mesh channel full (cap {})! Rendering thread probably can't keep up.",
+                MESH_CHANNEL_CAPACITY
+            ),
+        }
+
+        timer.stop();
+    }
+}
+
+fn create_mesh() -> Mesh {
     use lyon::math::{point, Point};
     use lyon::path::Path;
     use lyon::tessellation::*;
@@ -773,7 +820,10 @@ fn create_mesh() -> (Vec<Vertex>, Vec<IndexType>) {
             .unwrap();
     }
 
-    (geometry.vertices, geometry.indices)
+    Mesh {
+        vertices: geometry.vertices,
+        indices: geometry.indices,
+    }
 }
 
 fn write_to_cpu_accessible_buffer<D: DeviceV1_0, T>(
