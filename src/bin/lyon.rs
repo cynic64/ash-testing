@@ -827,9 +827,16 @@ fn create_mesh(points: &[VkPos]) -> Mesh {
     builder.quadratic_bezier_to(point(0.0, 0.0), point(-1.0, 1.0));
     builder.line_to(point((x * PI * 0.5).sin(), (x * PI * 0.5).cos()));
     builder.quadratic_bezier_to(point(0.0, 0.0), point(1.0, 1.0));
-     */
     points.iter().for_each(|pos| {
-        builder.line_to(point(pos[0] as f32, pos[1] as f32));
+        let cursor_point = point(pos[0] as f32, pos[1] as f32);
+        builder.line_to(cursor_point);
+    });
+     */
+
+    points.chunks_exact(2).for_each(|pos_arr: &[VkPos]| {
+        let intermediate = point(pos_arr[0][0] as f32, pos_arr[0][1] as f32);
+        let dest = point(pos_arr[1][0] as f32, pos_arr[1][1] as f32);
+        builder.quadratic_bezier_to(intermediate, dest);
     });
 
     let path = builder.build();
