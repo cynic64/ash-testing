@@ -363,6 +363,15 @@ pub fn main() {
     // winit does not have a function to get the current mouse position, so
     // instead we keep track of it and update it every time the mouse moves
     let mut mouse_pos = [0.0, 0.0];
+    
+    // also track whether the LMB is down or not
+    let mut mouse_down = false;
+    
+    // and last location we sent to the mesh-generating thread (because sending
+    // locations very close together is pointless)
+    let mut last_sent_mouse_pos: PixelPos = [-9999.0, -9999.0];
+    // at least 10 pixels in between every sending of the mouse position
+    let mouse_pos_send_thresh_dist = 10.0;
 
     // timers
     let mut timer_mesh_wait = LoopTimer::new("Waiting on mesh gen".to_string());
@@ -447,21 +456,31 @@ pub fn main() {
             Event::WindowEvent {
                 event:
                     WindowEvent::MouseInput {
-                        state: ElementState::Pressed,
+                        state,
                         button: MouseButton::Left,
                         ..
                     },
                 ..
             } => {
-                click_send
-                    .send(pixel_to_vk(swapchain_dims, mouse_pos))
-                    .unwrap();
-            }
+                match state {
+                    ElementState::Pressed => mouse_down = true,
+                    ElementState::Released => mouse_down = false,
+                }
+            },
             _ => {}
         });
 
         if exit {
             break;
+        }
+        
+        if mouse_down {
+            // only send mouse pos if it's over a certain distance from the
+            // previous position sent
+            if pixel_dist(&mouse_pos, &last_sent_mouse_pos) > mouse_pos_send_thresh_dist {
+                click_send.send(pixel_to_vk(swapchain_dims, &mouse_pos)).unwrap();
+                last_sent_mouse_pos = mouse_pos;
+            }
         }
 
         let flying_frame_idx = frames_drawn % MAX_FRAMES_IN_FLIGHT;
@@ -580,40 +599,49 @@ pub fn main() {
         let ibuf_copied_fence = flying_frames[flying_frame_idx].ibuf_copied_fence;
 
         // map and write vertex data to vertex staging buffer
-        timer_write_vbuf.start();
-        write_to_cpu_accessible_buffer(&device, vertex_staging_buffer_memory, &mesh.vertices);
-        timer_write_vbuf.stop();
+        let mut copy_command_buffers = None;
+        if mesh.vertices.len() > 0 {
+            // reset the fences that will be used
+            unsafe { device.reset_fences(&[vbuf_copied_fence, ibuf_copied_fence]) }
+                .expect("Couldn't reset vbuf_ and ibuf_copied_fence");
 
-        // copy staging buffer to vertex buffer
-        timer_copy_vbuf.start();
-        let vbuf_command_buffer = copy_buffer(
-            &device,
-            queue,
-            command_pool,
-            vertex_staging_buffer,
-            vertex_buffer,
-            vertex_buffer_size,
-            vbuf_copied_fence,
-        );
-        timer_copy_vbuf.stop();
+            timer_write_vbuf.start();
+            write_to_cpu_accessible_buffer(&device, vertex_staging_buffer_memory, &mesh.vertices);
+            timer_write_vbuf.stop();
+            
+            // copy staging buffer to vertex buffer
+            timer_copy_vbuf.start();
+            let vbuf_command_buffer = copy_buffer(
+                &device,
+                queue,
+                command_pool,
+                vertex_staging_buffer,
+                vertex_buffer,
+                vertex_buffer_size,
+                vbuf_copied_fence,
+            );
+            timer_copy_vbuf.stop();
 
-        // map and write index data to staging buffer
-        timer_write_ibuf.start();
-        write_to_cpu_accessible_buffer(&device, index_staging_buffer_memory, &mesh.indices);
-        timer_write_ibuf.stop();
+            // map and write index data to staging buffer
+                timer_write_ibuf.start();
+                write_to_cpu_accessible_buffer(&device, index_staging_buffer_memory, &mesh.indices);
+                timer_write_ibuf.stop();
 
-        // copy staging buffer to index buffer
-        timer_copy_ibuf.start();
-        let ibuf_command_buffer = copy_buffer(
-            &device,
-            queue,
-            command_pool,
-            index_staging_buffer,
-            index_buffer,
-            index_buffer_size,
-            ibuf_copied_fence,
-        );
-        timer_copy_ibuf.stop();
+            // copy staging buffer to index buffer
+            timer_copy_ibuf.start();
+            let ibuf_command_buffer = copy_buffer(
+                &device,
+                queue,
+                command_pool,
+                index_staging_buffer,
+                index_buffer,
+                index_buffer_size,
+                ibuf_copied_fence,
+            );
+            timer_copy_ibuf.stop();
+            
+            copy_command_buffers = Some((vbuf_command_buffer, ibuf_command_buffer));
+        }
 
         // create command buffer
         let command_buffer = create_command_buffer(
@@ -630,22 +658,20 @@ pub fn main() {
 
         flying_frames[frames_drawn % MAX_FRAMES_IN_FLIGHT].command_buffer = Some(command_buffer);
 
-        timer_copy_complete.start();
-        // before we submit, wait for both copy operations to finish
-        unsafe {
-            device.wait_for_fences(&[vbuf_copied_fence, ibuf_copied_fence], true, std::u64::MAX)
+        if let Some((vbuf_cbuf, ibuf_cbuf)) = copy_command_buffers {
+            timer_copy_complete.start();
+            // before we submit, wait for both copy operations to finish
+            unsafe {
+                device.wait_for_fences(&[vbuf_copied_fence, ibuf_copied_fence], true, std::u64::MAX)
+            }
+            .expect("Couldn't wait for vertex and index buffer to finish copying");
+            timer_copy_complete.stop();
+        
+            // free the command buffers used to copy
+            unsafe {
+                device.free_command_buffers(command_pool, &[vbuf_cbuf, ibuf_cbuf])
+            };
         }
-        .expect("Couldn't wait for vertex and index buffer to finish copying");
-        timer_copy_complete.stop();
-
-        // free the command buffers used to copy
-        unsafe {
-            device.free_command_buffers(command_pool, &[vbuf_command_buffer, ibuf_command_buffer])
-        };
-
-        // reset the fences used
-        unsafe { device.reset_fences(&[vbuf_copied_fence, ibuf_copied_fence]) }
-            .expect("Couldn't reset vbuf_ and ibuf_copied_fence");
 
         // submit command buffer
         let wait_semaphores = [image_available_semaphore];
@@ -801,12 +827,9 @@ fn mesh_thread(mesh_send: Sender<Mesh>, click_recv: Receiver<VkPos>) {
                 timer.print();
                 return;
             }
-            Err(TrySendError::Full(_)) => eprintln!(
-                "Mesh channel full (cap {})! Rendering thread probably can't keep up.",
-                MESH_CHANNEL_CAPACITY
-            ),
+            Err(TrySendError::Full(_)) => {},
         }
-
+            
         timer.stop();
     }
 }
@@ -889,7 +912,7 @@ fn write_to_cpu_accessible_buffer<D: DeviceV1_0, T>(
     data: &[T],
 ) {
     let buffer_size = size_of_slice(data);
-
+    
     unsafe {
         let mapped_memory = device
             .map_memory(buffer_memory, 0, buffer_size, vk::MemoryMapFlags::empty())
@@ -1334,13 +1357,7 @@ fn setup_flying_frames<D: DeviceV1_0>(
         flags: vk::SemaphoreCreateFlags::empty(),
     };
 
-    let unsignalled_fence_info = vk::FenceCreateInfo {
-        s_type: vk::StructureType::FENCE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::FenceCreateFlags::empty(),
-    };
-
-    let signalled_fence_info = vk::FenceCreateInfo {
+    let fence_info = vk::FenceCreateInfo {
         s_type: vk::StructureType::FENCE_CREATE_INFO,
         p_next: ptr::null(),
         flags: vk::FenceCreateFlags::SIGNALED,
@@ -1388,13 +1405,13 @@ fn setup_flying_frames<D: DeviceV1_0>(
                 unsafe { device.create_semaphore(&semaphore_info, None) }
                     .expect("Couldn't create semaphore");
 
-            let render_finished_fence = unsafe { device.create_fence(&signalled_fence_info, None) }
+            let render_finished_fence = unsafe { device.create_fence(&fence_info, None) }
                 .expect("Couldn't create fence");
 
-            let vbuf_copied_fence = unsafe { device.create_fence(&unsignalled_fence_info, None) }
+            let vbuf_copied_fence = unsafe { device.create_fence(&fence_info, None) }
                 .expect("Couldn't create fence");
 
-            let ibuf_copied_fence = unsafe { device.create_fence(&unsignalled_fence_info, None) }
+            let ibuf_copied_fence = unsafe { device.create_fence(&fence_info, None) }
                 .expect("Couldn't create fence");
 
             FlyingFrame {
@@ -1852,7 +1869,7 @@ fn read_shader_code(shader_path: &Path) -> Vec<u8> {
     bytes_code
 }
 
-fn pixel_to_vk(screen_dims: vk::Extent2D, pixel_pos: PixelPos) -> VkPos {
+fn pixel_to_vk(screen_dims: vk::Extent2D, pixel_pos: &PixelPos) -> VkPos {
     let screen_width = screen_dims.width as f64;
     let screen_height = screen_dims.height as f64;
 
@@ -1864,4 +1881,8 @@ fn pixel_to_vk(screen_dims: vk::Extent2D, pixel_pos: PixelPos) -> VkPos {
 
 fn vk_to_point(vk_pos: &VkPos) -> lyon::math::Point {
     lyon::math::point(vk_pos[0] as f32, vk_pos[1] as f32)
+}
+
+fn pixel_dist(a: &PixelPos, b: &PixelPos) -> f64 {
+    ((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1])).sqrt()
 }
