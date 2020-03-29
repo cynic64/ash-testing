@@ -7,7 +7,7 @@ use ash::{vk, vk_make_version, Entry};
 use winit::dpi::LogicalPosition;
 use winit::{ElementState, Event, MouseButton, WindowEvent};
 
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, Sender};
 
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
@@ -45,7 +45,8 @@ const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
 type IndexType = u32;
 
-const MESH_CHANNEL_CAPACITY: usize = 8;
+// 0-capacity channels have the best performance
+const MESH_CHANNEL_CAPACITY: usize = 0;
 
 const KINKINESS: f64 = 0.2;
 
@@ -363,10 +364,10 @@ pub fn main() {
     // winit does not have a function to get the current mouse position, so
     // instead we keep track of it and update it every time the mouse moves
     let mut mouse_pos = [0.0, 0.0];
-    
+
     // also track whether the LMB is down or not
     let mut mouse_down = false;
-    
+
     // and last location we sent to the mesh-generating thread (because sending
     // locations very close together is pointless)
     let mut last_sent_mouse_pos: PixelPos = [-9999.0, -9999.0];
@@ -461,11 +462,9 @@ pub fn main() {
                         ..
                     },
                 ..
-            } => {
-                match state {
-                    ElementState::Pressed => mouse_down = true,
-                    ElementState::Released => mouse_down = false,
-                }
+            } => match state {
+                ElementState::Pressed => mouse_down = true,
+                ElementState::Released => mouse_down = false,
             },
             _ => {}
         });
@@ -473,12 +472,14 @@ pub fn main() {
         if exit {
             break;
         }
-        
+
         if mouse_down {
             // only send mouse pos if it's over a certain distance from the
             // previous position sent
             if pixel_dist(&mouse_pos, &last_sent_mouse_pos) > mouse_pos_send_thresh_dist {
-                click_send.send(pixel_to_vk(swapchain_dims, &mouse_pos)).unwrap();
+                click_send
+                    .send(pixel_to_vk(swapchain_dims, &mouse_pos))
+                    .unwrap();
                 last_sent_mouse_pos = mouse_pos;
             }
         }
@@ -608,7 +609,7 @@ pub fn main() {
             timer_write_vbuf.start();
             write_to_cpu_accessible_buffer(&device, vertex_staging_buffer_memory, &mesh.vertices);
             timer_write_vbuf.stop();
-            
+
             // copy staging buffer to vertex buffer
             timer_copy_vbuf.start();
             let vbuf_command_buffer = copy_buffer(
@@ -623,9 +624,9 @@ pub fn main() {
             timer_copy_vbuf.stop();
 
             // map and write index data to staging buffer
-                timer_write_ibuf.start();
-                write_to_cpu_accessible_buffer(&device, index_staging_buffer_memory, &mesh.indices);
-                timer_write_ibuf.stop();
+            timer_write_ibuf.start();
+            write_to_cpu_accessible_buffer(&device, index_staging_buffer_memory, &mesh.indices);
+            timer_write_ibuf.stop();
 
             // copy staging buffer to index buffer
             timer_copy_ibuf.start();
@@ -639,7 +640,7 @@ pub fn main() {
                 ibuf_copied_fence,
             );
             timer_copy_ibuf.stop();
-            
+
             copy_command_buffers = Some((vbuf_command_buffer, ibuf_command_buffer));
         }
 
@@ -666,11 +667,9 @@ pub fn main() {
             }
             .expect("Couldn't wait for vertex and index buffer to finish copying");
             timer_copy_complete.stop();
-        
+
             // free the command buffers used to copy
-            unsafe {
-                device.free_command_buffers(command_pool, &[vbuf_cbuf, ibuf_cbuf])
-            };
+            unsafe { device.free_command_buffers(command_pool, &[vbuf_cbuf, ibuf_cbuf]) };
         }
 
         // submit command buffer
@@ -820,17 +819,16 @@ fn mesh_thread(mesh_send: Sender<Mesh>, click_recv: Receiver<VkPos>) {
 
         let mesh = create_mesh(&points);
 
-        match mesh_send.try_send(mesh) {
-            Ok(_) => {}
-            Err(TrySendError::Disconnected(_)) => {
+        timer.stop();
+
+        match mesh_send.send(mesh) {
+            Ok(()) => {}
+            Err(_) => {
                 println!("Mesh receiver disconnected, mesh gen thread quitting");
                 timer.print();
                 return;
             }
-            Err(TrySendError::Full(_)) => {},
         }
-            
-        timer.stop();
     }
 }
 
@@ -854,13 +852,23 @@ fn create_mesh(points: &[VkPos]) -> Mesh {
     // can actually draw the first and last point, rather than using them as
     // guides for control points
     // extrapolate backwards: a - (b - a) = 2a - b
-    let first_point = vec![[2.0 * points[0][0] - points[1][0], 2.0 * points[0][1] - points[1][1]]];
+    let first_point = vec![[
+        2.0 * points[0][0] - points[1][0],
+        2.0 * points[0][1] - points[1][1],
+    ]];
     // extrapolate forwards: b + (b - a) = 2b - a
     let len = points.len();
-    let last_point = vec![[2.0 * points[len - 1][0] - points[len - 2][0], 2.0 * points[len - 1][1] - points[len - 2][1]]];
-    
-    let points: Vec<_> = first_point.iter().chain(points).chain(&last_point).collect();
-    
+    let last_point = vec![[
+        2.0 * points[len - 1][0] - points[len - 2][0],
+        2.0 * points[len - 1][1] - points[len - 2][1],
+    ]];
+
+    let points: Vec<_> = first_point
+        .iter()
+        .chain(points)
+        .chain(&last_point)
+        .collect();
+
     builder.move_to(vk_to_point(&points[1]));
 
     // last point is used as a control point, and penultimate point is joined
@@ -923,7 +931,7 @@ fn write_to_cpu_accessible_buffer<D: DeviceV1_0, T>(
     data: &[T],
 ) {
     let buffer_size = size_of_slice(data);
-    
+
     unsafe {
         let mapped_memory = device
             .map_memory(buffer_memory, 0, buffer_size, vk::MemoryMapFlags::empty())
@@ -1416,14 +1424,14 @@ fn setup_flying_frames<D: DeviceV1_0>(
                 unsafe { device.create_semaphore(&semaphore_info, None) }
                     .expect("Couldn't create semaphore");
 
-            let render_finished_fence = unsafe { device.create_fence(&fence_info, None) }
-                .expect("Couldn't create fence");
+            let render_finished_fence =
+                unsafe { device.create_fence(&fence_info, None) }.expect("Couldn't create fence");
 
-            let vbuf_copied_fence = unsafe { device.create_fence(&fence_info, None) }
-                .expect("Couldn't create fence");
+            let vbuf_copied_fence =
+                unsafe { device.create_fence(&fence_info, None) }.expect("Couldn't create fence");
 
-            let ibuf_copied_fence = unsafe { device.create_fence(&fence_info, None) }
-                .expect("Couldn't create fence");
+            let ibuf_copied_fence =
+                unsafe { device.create_fence(&fence_info, None) }.expect("Couldn't create fence");
 
             FlyingFrame {
                 image_available_semaphore,
