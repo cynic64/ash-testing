@@ -842,14 +842,25 @@ fn create_mesh(points: &[VkPos]) -> Mesh {
 
     let mut builder = Path::builder();
 
-    // need at least 4 points since we use cubic beziers
-    if points.len() < 4 {
+    // need at least 2 points
+    if points.len() < 2 {
         return Mesh {
             vertices: vec![],
             indices: vec![],
         };
     }
 
+    // linearly extrapolate one point on either end of the point list to so we
+    // can actually draw the first and last point, rather than using them as
+    // guides for control points
+    // extrapolate backwards: a - (b - a) = 2a - b
+    let first_point = vec![[2.0 * points[0][0] - points[1][0], 2.0 * points[0][1] - points[1][1]]];
+    // extrapolate forwards: b + (b - a) = 2b - a
+    let len = points.len();
+    let last_point = vec![[2.0 * points[len - 1][0] - points[len - 2][0], 2.0 * points[len - 1][1] - points[len - 2][1]]];
+    
+    let points: Vec<_> = first_point.iter().chain(points).chain(&last_point).collect();
+    
     builder.move_to(vk_to_point(&points[1]));
 
     // last point is used as a control point, and penultimate point is joined
