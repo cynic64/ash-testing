@@ -47,6 +47,8 @@ type IndexType = u32;
 
 const MESH_CHANNEL_CAPACITY: usize = 8;
 
+const KINKINESS: f64 = 0.2;
+
 // range from 0.0 .. screen size
 type PixelPos = [f64; 2];
 
@@ -817,27 +819,35 @@ fn create_mesh(points: &[VkPos]) -> Mesh {
 
     let mut builder = Path::builder();
 
-    builder.move_to(lyon::math::point(0.0, 0.0));
-    
-    // first point is used as a control point, so make sure the points list
-    // isn't empty
-    if points.len() == 0 {
+    // need at least 4 points since we use cubic beziers
+    if points.len() < 4 {
         return Mesh {
             vertices: vec![],
             indices: vec![],
         };
     }
-    
-    // all subsequent points use the reflection of the previous control point
-    // across themselves as their control point
-    let mut control_point = points[0];
-    for point_idx in 1..points.len() {
-        let point = points[point_idx];
-        
-        builder.quadratic_bezier_to(vk_to_point(&control_point), vk_to_point(&point));
 
-        // a + (a - b) --> 2a - b
-        control_point = [2.0 * point[0] - control_point[0], 2.0 * point[1] - control_point[1]];
+    builder.move_to(vk_to_point(&points[1]));
+
+    // last point is used as a control point, and penultimate point is joined
+    // to, so only go to len - 2
+    for i in 1..points.len() - 2 {
+        // we join x and y, using w and z to dictate the control points (a and b)
+        let x = points[i];
+        let y = points[i + 1];
+        let w = points[i - 1];
+        let z = points[i + 2];
+
+        let a = [
+            x[0] + KINKINESS * y[0] - KINKINESS * w[0],
+            x[1] + KINKINESS * y[1] - KINKINESS * w[1],
+        ];
+        let b = [
+            y[0] - KINKINESS * z[0] + KINKINESS * x[0],
+            y[1] - KINKINESS * z[1] + KINKINESS * x[1],
+        ];
+
+        builder.cubic_bezier_to(vk_to_point(&a), vk_to_point(&b), vk_to_point(&y));
     }
 
     let path = builder.build();
