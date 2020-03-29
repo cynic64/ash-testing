@@ -851,7 +851,7 @@ fn create_mesh(points: &[VkPos]) -> Mesh {
             .tessellate(
                 &path,
                 &StrokeOptions::DEFAULT
-                    .with_line_width(0.05)
+                    .with_line_width(0.01)
                     .with_tolerance(0.000001)
                     .with_start_cap(LineCap::Round)
                     .with_end_cap(LineCap::Round),
