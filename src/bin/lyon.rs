@@ -810,34 +810,35 @@ fn mesh_thread(mesh_send: Sender<Mesh>, click_recv: Receiver<VkPos>) {
 }
 
 fn create_mesh(points: &[VkPos]) -> Mesh {
-    use lyon::math::{point, Point};
+    use lyon::math::Point;
     use lyon::path::Path;
     use lyon::tessellation::*;
     use lyon_tessellation::{LineCap, StrokeOptions, StrokeTessellator};
 
     let mut builder = Path::builder();
 
-    builder.move_to(point(0.0, 0.0));
-    /*
-    builder.line_to(point((x * PI * 0.5).sin(), (x * PI * 0.5).cos()));
-    builder.quadratic_bezier_to(point(0.0, 0.0), point(-1.0, -1.0));
-    builder.line_to(point((x * PI * 0.5).sin(), (x * PI * 0.5).cos()));
-    builder.quadratic_bezier_to(point(0.0, 0.0), point(1.0, -1.0));
-    builder.line_to(point((x * PI * 0.5).sin(), (x * PI * 0.5).cos()));
-    builder.quadratic_bezier_to(point(0.0, 0.0), point(-1.0, 1.0));
-    builder.line_to(point((x * PI * 0.5).sin(), (x * PI * 0.5).cos()));
-    builder.quadratic_bezier_to(point(0.0, 0.0), point(1.0, 1.0));
-    points.iter().for_each(|pos| {
-        let cursor_point = point(pos[0] as f32, pos[1] as f32);
-        builder.line_to(cursor_point);
-    });
-     */
+    builder.move_to(lyon::math::point(0.0, 0.0));
+    
+    // first point is used as a control point, so make sure the points list
+    // isn't empty
+    if points.len() == 0 {
+        return Mesh {
+            vertices: vec![],
+            indices: vec![],
+        };
+    }
+    
+    // all subsequent points use the reflection of the previous control point
+    // across themselves as their control point
+    let mut control_point = points[0];
+    for point_idx in 1..points.len() {
+        let point = points[point_idx];
+        
+        builder.quadratic_bezier_to(vk_to_point(&control_point), vk_to_point(&point));
 
-    points.chunks_exact(2).for_each(|pos_arr: &[VkPos]| {
-        let intermediate = point(pos_arr[0][0] as f32, pos_arr[0][1] as f32);
-        let dest = point(pos_arr[1][0] as f32, pos_arr[1][1] as f32);
-        builder.quadratic_bezier_to(intermediate, dest);
-    });
+        // a + (a - b) --> 2a - b
+        control_point = [2.0 * point[0] - control_point[0], 2.0 * point[1] - control_point[1]];
+    }
 
     let path = builder.build();
 
@@ -1849,4 +1850,8 @@ fn pixel_to_vk(screen_dims: vk::Extent2D, pixel_pos: PixelPos) -> VkPos {
         (pixel_pos[0] - screen_width * 0.5) / screen_width * 2.0,
         (pixel_pos[1] - screen_height * 0.5) / screen_height * 2.0,
     ]
+}
+
+fn vk_to_point(vk_pos: &VkPos) -> lyon::math::Point {
+    lyon::math::point(vk_pos[0] as f32, vk_pos[1] as f32)
 }
