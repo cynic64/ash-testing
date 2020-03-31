@@ -7,7 +7,11 @@ use ash::{vk, vk_make_version, Entry};
 use winit::dpi::LogicalPosition;
 use winit::{ElementState, Event, MouseButton, WindowEvent};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
+
+use rand::Rng;
+use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
@@ -45,10 +49,13 @@ const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
 type IndexType = u32;
 
-// 0-capacity channels have the best performance
-const MESH_CHANNEL_CAPACITY: usize = 0;
+// 0-capacity, >0-capacity and unbounded channels all have roughly the same
+// throughput according to my very rough benchmarks
+const MESH_CHANNEL_CAPACITY: usize = 8;
 
 const KINKINESS: f64 = 0.2;
+
+const DEBUG_GENERATE_POINTS: bool = true;
 
 // range from 0.0 .. screen size
 type PixelPos = [f64; 2];
@@ -382,6 +389,7 @@ pub fn main() {
     let mut timer_write_ibuf = LoopTimer::new("Write ibuf".to_string());
     let mut timer_copy_ibuf = LoopTimer::new("Copy ibuf".to_string());
     let mut timer_copy_complete = LoopTimer::new("Copy completion".to_string());
+    let mut timer_create_cbuf = LoopTimer::new("Create command buffer".to_string());
 
     loop {
         if must_recreate_swapchain {
@@ -645,6 +653,7 @@ pub fn main() {
         }
 
         // create command buffer
+        timer_create_cbuf.start();
         let command_buffer = create_command_buffer(
             &device,
             render_pass,
@@ -656,6 +665,7 @@ pub fn main() {
             index_buffer,
             mesh.indices.len() as u32,
         );
+        timer_create_cbuf.stop();
 
         flying_frames[frames_drawn % MAX_FRAMES_IN_FLIGHT].command_buffer = Some(command_buffer);
 
@@ -749,6 +759,7 @@ pub fn main() {
     timer_write_ibuf.print();
     timer_copy_ibuf.print();
     timer_copy_complete.print();
+    timer_create_cbuf.print();
 
     unsafe { device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
 
@@ -810,7 +821,11 @@ pub fn main() {
 fn mesh_thread(mesh_send: Sender<Mesh>, click_recv: Receiver<VkPos>) {
     let mut timer = LoopTimer::new("Mesh generation".to_string());
 
-    let mut points = vec![];
+    let mut points = if DEBUG_GENERATE_POINTS {
+        create_debug_points()
+    } else {
+        vec![]
+    };
 
     loop {
         timer.start();
@@ -819,11 +834,19 @@ fn mesh_thread(mesh_send: Sender<Mesh>, click_recv: Receiver<VkPos>) {
 
         let mesh = create_mesh(&points);
 
+        println!(
+            "Total bytes in mesh: {}, vertices: {}, indices: {}",
+            size_of_slice(&mesh.vertices) + size_of_slice(&mesh.indices),
+            mesh.vertices.len(),
+            mesh.indices.len()
+        );
+
         timer.stop();
 
-        match mesh_send.send(mesh) {
+        match mesh_send.try_send(mesh) {
             Ok(()) => {}
-            Err(_) => {
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
                 println!("Mesh receiver disconnected, mesh gen thread quitting");
                 timer.print();
                 return;
@@ -904,7 +927,7 @@ fn create_mesh(points: &[VkPos]) -> Mesh {
                 &path,
                 &StrokeOptions::DEFAULT
                     .with_line_width(0.01)
-                    .with_tolerance(0.000001)
+                    .with_tolerance(0.0001)
                     .with_start_cap(LineCap::Round)
                     .with_end_cap(LineCap::Round),
                 &mut BuffersBuilder::new(&mut geometry, |pos: Point, _: StrokeAttributes| Vertex {
@@ -923,6 +946,22 @@ fn create_mesh(points: &[VkPos]) -> Mesh {
         vertices: geometry.vertices,
         indices: geometry.indices,
     }
+}
+
+fn create_debug_points() -> Vec<VkPos> {
+    // creates a list of randomly-generated points from the same seed every
+    // time, so that performance of the program can be judged more easily
+
+    let mut rng = ChaCha20Rng::seed_from_u64(0);
+    // with tolerance 0.0001, 4 points gives 792 indices and 300 points gives
+    // 89,952
+    (0..4)
+        .map(|_| {
+            let x = rng.gen::<f64>() * 2.0 - 1.0;
+            let y = rng.gen::<f64>() * 2.0 - 1.0;
+            [x, y]
+        })
+        .collect()
 }
 
 fn write_to_cpu_accessible_buffer<D: DeviceV1_0, T>(
