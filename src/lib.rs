@@ -1,3 +1,5 @@
+pub mod single_pipe_renderer;
+
 use std::path::PathBuf;
 
 pub fn relative_path(local_path: &str) -> PathBuf {
