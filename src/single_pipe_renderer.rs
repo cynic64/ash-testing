@@ -55,6 +55,9 @@ pub struct Renderer<V> {
     timer_copy_ibuf: LoopTimer,
     timer_copy_complete: LoopTimer,
     timer_create_cbuf: LoopTimer,
+
+    flying_frame_idx: Option<usize>,
+    acquired_image_idx: Option<u32>,
 }
 
 pub struct Mesh<V> {
@@ -200,365 +203,54 @@ impl<V> Renderer<V> {
             timer_copy_ibuf,
             timer_copy_complete,
             timer_create_cbuf,
+
+            flying_frame_idx: None,
+            acquired_image_idx: None,
         }
     }
 
     pub fn start(&mut self) {
         loop {
             if self.must_recreate_swapchain {
-                unsafe { self.device.device_wait_idle() }
-                    .expect("Couldn't wait for self.device to become idle");
-
-                // Cleanup_swapchain requires ownership of these to destroy
-                // them. They will be re-created later. Technically I think it
-                // would also work to pass pointers to cleanup_swapchain instead
-                // of transferring ownership, but I don't like the idea of that
-                // because then values in command_buffers and framebuffers would
-                // point to destroyed vulkan objects.
-                let our_framebuffers = std::mem::replace(&mut self.framebuffers, vec![]);
-                let our_swapchain_image_views =
-                    std::mem::replace(&mut self.swapchain_image_views, vec![]);
-
-                cleanup_swapchain(
-                    &self.device,
-                    &self.swapchain_creator,
-                    our_framebuffers,
-                    our_swapchain_image_views,
-                    self.swapchain,
-                );
-
-                // re-create swapchain
-                let ret = create_swapchain(
-                    self.physical_device,
-                    &self.surface_loader,
-                    self.surface,
-                    &self.swapchain_creator,
-                );
-
-                self.swapchain = ret.0;
-                self.swapchain_images = ret.1;
-                self.swapchain_dims = ret.2;
-
-                // re-create image views
-                self.swapchain_image_views = create_swapchain_image_views(&self.device, &self.swapchain_images);
-
-                // re-create framebuffers
-                // framebuffer creation
-                self.framebuffers = create_framebuffers(
-                    &self.device,
-                    self.render_pass,
-                    self.swapchain_dims,
-                    &self.swapchain_image_views,
-                );
-
-                self.must_recreate_swapchain = false;
+                self.recreate_swapchain();
             }
 
-            let mut exit = false;
-
-            // necessary because the borrow checker can't figure out that
-            // self.events_loop.poll_events() doesn't borrow all of self
-            let event_send = &self.event_send;
-            self.events_loop.poll_events(|ev| match ev {
-                Event::WindowEvent {
-                    event: WindowEvent::CloseRequested,
-                    ..
-                } => exit = true,
-                Event::WindowEvent { event, .. } => event_send.send(event).unwrap(),
-                _ => {}
-            });
-
-            if exit {
+            if self.process_events() {
                 break;
             }
 
-            let flying_frame_idx = self.frames_drawn % MAX_FRAMES_IN_FLIGHT;
-            let frame = &self.flying_frames[flying_frame_idx];
+            self.flying_frame_idx = Some(self.frames_drawn % MAX_FRAMES_IN_FLIGHT);
 
-            let image_available_semaphore = frame.image_available_semaphore;
-            let render_finished_semaphore = frame.render_finished_semaphore;
-            let render_finished_fence = frame.render_finished_fence;
+            self.cleanup_prev_frame();
 
-            // we can't use this sync set until whichever rendering was using it
-            // previously is finished, so wait for rendering to finished (use the
-            // fence because it's a GPU - CPU sync)
-            unsafe {
-                self.device
-                    .wait_for_fences(&[render_finished_fence], true, std::u64::MAX)
-            }
-            .expect("Couldn't wait for previous sync set to finish rendering");
-
-            // since rendering has finished, we can free that command buffer
-            if let Some(command_buffer) = frame.command_buffer {
-                unsafe {
-                    self.device
-                        .free_command_buffers(self.command_pool, &[command_buffer])
-                };
-            } else {
-                // should only happen when swapchain images are first used, panic
-                // otherwise
-                if self.frames_drawn >= MAX_FRAMES_IN_FLIGHT {
-                    panic!(
-                        "No command buffer in flying frame on frame {}",
-                        self.frames_drawn
-                    );
-                }
+            self.acquire_image();
+            if self.must_recreate_swapchain {
+                continue;
             }
 
-            // image_available_semaphore will be signalled once the swapchain image
-            // is actually available and not being displayed anymore -
-            // acquire_next_image will return the instant it knows which image index
-            // will be free next, so we need to wait on that semaphore
-            let acquire_result = unsafe {
-                self.swapchain_creator.acquire_next_image(
-                    self.swapchain,
-                    std::u64::MAX,
-                    image_available_semaphore,
-                    vk::Fence::null(),
-                )
-            };
-
-            let image_idx = match acquire_result {
-                Ok((image_idx, _is_sub_optimal)) => image_idx,
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    self.must_recreate_swapchain = true;
-                    continue;
-                }
-                Err(e) => panic!("Unexpected error during acquire_next_image: {}", e),
-            };
-
-            // because we might have more sync sets than swapchain images, it's
-            // possible another set of sync sets is still rendering to this
-            // swapchain image. by waiting on the fence associated with this
-            // swapchain image, we can ensure it really is available
-            if let Some(image_fence) = self.swapchain_fences[image_idx as usize] {
-                unsafe {
-                    self.device
-                        .wait_for_fences(&[image_fence], true, std::u64::MAX)
-                }
-                .expect("Couldn't wait for image_in_flight fence");
-            } else {
-                // this should only happen on the first MAX_FRAMES_IN_FLIGHT frames
-                // drawn, because at that point we will not yet have started using
-                // all sync sets
-
-                // if it happens afterwards, panic
-                if self.frames_drawn >= MAX_FRAMES_IN_FLIGHT {
-                    panic!(
-                        "No fence for this swapchain image at frame {}! image_idx: {}",
-                        self.frames_drawn, image_idx
-                    );
-                }
-            }
+            self.wait_on_acquired_image();
 
             self.timer_draw.stop();
 
+            // get new mesh data
             self.timer_mesh_wait.start();
             let mesh = self.mesh_recv.recv().expect("Error when receiving mesh");
             self.timer_mesh_wait.stop();
 
-            // set the render_finished_fence associated with this swapchain image to
-            // the fence that will be signalled when we finish rendering - in other
-            // words, "We're using this image! Don't touch it till we finish."
-            self.swapchain_fences[image_idx as usize] = Some(render_finished_fence);
-
             // change mesh data on GPU
+            self.update_mesh_buffers(&mesh);
 
-            // make sure we won't go past the memory we've allocated
-            let vertex_buffer_size = size_of_slice(&mesh.vertices);
-            let index_buffer_size = size_of_slice(&mesh.indices);
+            self.create_command_buffer(mesh.indices.len() as u32);
 
-            assert!(
-                vertex_buffer_size < self.vertex_buffer_capacity,
-                "Vertex buffers ({}) too small for vertex data ({})!",
-                self.vertex_buffer_capacity,
-                vertex_buffer_size
-            );
+            self.submit_command_buffer();
 
-            assert!(
-                index_buffer_size < self.index_buffer_capacity,
-                "Index buffers ({}) too small for index data ({})!",
-                self.index_buffer_capacity,
-                index_buffer_size
-            );
-
-            // even though we modify these, we don't need to mutably borrow because
-            // they are magical Vulkan pointers that don't care about lifetimes
-            let vertex_staging_buffer = self.flying_frames[flying_frame_idx].vertex_staging_buffer;
-            let vertex_staging_buffer_memory =
-                self.flying_frames[flying_frame_idx].vertex_staging_buffer_memory;
-            let vertex_buffer = self.flying_frames[flying_frame_idx].vertex_buffer;
-            let index_buffer = self.flying_frames[flying_frame_idx].index_buffer;
-            let index_staging_buffer = self.flying_frames[flying_frame_idx].index_staging_buffer;
-            let index_staging_buffer_memory =
-                self.flying_frames[flying_frame_idx].index_staging_buffer_memory;
-
-            let vbuf_copied_fence = self.flying_frames[flying_frame_idx].vbuf_copied_fence;
-            let ibuf_copied_fence = self.flying_frames[flying_frame_idx].ibuf_copied_fence;
-
-            // map and write vertex data to vertex staging buffer
-            let mut copy_command_buffers = None;
-            if mesh.vertices.len() > 0 {
-                // reset the fences that will be used
-                unsafe {
-                    self.device
-                        .reset_fences(&[vbuf_copied_fence, ibuf_copied_fence])
-                }
-                .expect("Couldn't reset vbuf_ and ibuf_copied_fence");
-
-                self.timer_write_vbuf.start();
-                write_to_cpu_accessible_buffer(
-                    &self.device,
-                    vertex_staging_buffer_memory,
-                    &mesh.vertices,
-                );
-                self.timer_write_vbuf.stop();
-
-                // copy staging buffer to vertex buffer
-                self.timer_copy_vbuf.start();
-                let vbuf_command_buffer = copy_buffer(
-                    &self.device,
-                    self.queue,
-                    self.command_pool,
-                    vertex_staging_buffer,
-                    vertex_buffer,
-                    vertex_buffer_size,
-                    vbuf_copied_fence,
-                );
-                self.timer_copy_vbuf.stop();
-
-                // map and write index data to staging buffer
-                self.timer_write_ibuf.start();
-                write_to_cpu_accessible_buffer(
-                    &self.device,
-                    index_staging_buffer_memory,
-                    &mesh.indices,
-                );
-                self.timer_write_ibuf.stop();
-
-                // copy staging buffer to index buffer
-                self.timer_copy_ibuf.start();
-                let ibuf_command_buffer = copy_buffer(
-                    &self.device,
-                    self.queue,
-                    self.command_pool,
-                    index_staging_buffer,
-                    index_buffer,
-                    index_buffer_size,
-                    ibuf_copied_fence,
-                );
-                self.timer_copy_ibuf.stop();
-
-                copy_command_buffers = Some((vbuf_command_buffer, ibuf_command_buffer));
-            }
-
-            // create command buffer
-            self.timer_create_cbuf.start();
-            let command_buffer = create_command_buffer(
-                &self.device,
-                self.render_pass,
-                self.pipeline,
-                self.command_pool,
-                self.framebuffers[image_idx as usize],
-                self.swapchain_dims,
-                vertex_buffer,
-                index_buffer,
-                mesh.indices.len() as u32,
-            );
-            self.timer_create_cbuf.stop();
-
-            self.flying_frames[self.frames_drawn % MAX_FRAMES_IN_FLIGHT].command_buffer =
-                Some(command_buffer);
-
-            if let Some((vbuf_cbuf, ibuf_cbuf)) = copy_command_buffers {
-                self.timer_copy_complete.start();
-                // before we submit, wait for both copy operations to finish
-                unsafe {
-                    self.device.wait_for_fences(
-                        &[vbuf_copied_fence, ibuf_copied_fence],
-                        true,
-                        std::u64::MAX,
-                    )
-                }
-                .expect("Couldn't wait for vertex and index buffer to finish copying");
-                self.timer_copy_complete.stop();
-
-                // free the command buffers used to copy
-                unsafe {
-                    self.device
-                        .free_command_buffers(self.command_pool, &[vbuf_cbuf, ibuf_cbuf])
-                };
-            }
-
-            // submit command buffer
-            let wait_semaphores = [image_available_semaphore];
-
-            // "Each entry in the waitStages array corresponds to the semaphore with
-            // the same index in pWaitSemaphores."
-            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-
-            let cur_command_buffers = [command_buffer];
-
-            let signal_semaphores = [render_finished_semaphore];
-
-            let submit_info = vk::SubmitInfo {
-                s_type: vk::StructureType::SUBMIT_INFO,
-                p_next: ptr::null(),
-                wait_semaphore_count: 1,
-                p_wait_semaphores: wait_semaphores.as_ptr(),
-                p_wait_dst_stage_mask: wait_stages.as_ptr(),
-                command_buffer_count: 1,
-                p_command_buffers: cur_command_buffers.as_ptr(),
-                signal_semaphore_count: 1,
-                p_signal_semaphores: signal_semaphores.as_ptr(),
-            };
-
-            self.timer_draw.start();
-
-            // somebody else was previously using this fence and we waited until it
-            // was signalled (operation completed). now we need to reset it, because
-            // we aren't yet done but the fence says we are.
-            unsafe { self.device.reset_fences(&[render_finished_fence]) }
-                .expect("Couldn't reset render_finished_fence");
-
-            let submissions = [submit_info];
-            unsafe {
-                self.device
-                    .queue_submit(self.queue, &submissions, render_finished_fence)
-            }
-            .expect("Couldn't submit command buffer");
-
-            // present result to swapchain
-            let swapchains = [self.swapchain];
-            let image_indices = [image_idx];
-
-            let present_info = vk::PresentInfoKHR {
-                s_type: vk::StructureType::PRESENT_INFO_KHR,
-                p_next: ptr::null(),
-                wait_semaphore_count: 1,
-                p_wait_semaphores: signal_semaphores.as_ptr(),
-                swapchain_count: 1,
-                p_swapchains: swapchains.as_ptr(),
-                p_image_indices: image_indices.as_ptr(),
-                p_results: ptr::null_mut(),
-            };
-
-            match unsafe {
-                self.swapchain_creator
-                    .queue_present(self.queue, &present_info)
-            } {
-                Ok(_idk_what_this_is) => (),
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    self.must_recreate_swapchain = true;
-                    continue;
-                }
-                Err(e) => panic!("Unexpected error during queue_present: {}", e),
-            };
-
-            self.frames_drawn += 1;
+            self.present();
         }
 
-        println!("FPS: {:.2}", self.frames_drawn as f64 / get_elapsed(self.start_time));
+        println!(
+            "FPS: {:.2}",
+            self.frames_drawn as f64 / get_elapsed(self.start_time)
+        );
         println!(
             "Average delta in ms: {:.5}",
             get_elapsed(self.start_time) / self.frames_drawn as f64 * 1_000.0
@@ -574,6 +266,381 @@ impl<V> Renderer<V> {
         self.timer_create_cbuf.print();
     }
 
+    fn recreate_swapchain(&mut self) {
+        unsafe { self.device.device_wait_idle() }
+            .expect("Couldn't wait for self.device to become idle");
+
+        // Cleanup_swapchain requires ownership of these to destroy
+        // them. They will be re-created later. Technically I think it
+        // would also work to pass pointers to cleanup_swapchain instead
+        // of transferring ownership, but I don't like the idea of that
+        // because then values in command_buffers and framebuffers would
+        // point to destroyed vulkan objects.
+        let our_framebuffers = std::mem::replace(&mut self.framebuffers, vec![]);
+        let our_swapchain_image_views = std::mem::replace(&mut self.swapchain_image_views, vec![]);
+
+        cleanup_swapchain(
+            &self.device,
+            &self.swapchain_creator,
+            our_framebuffers,
+            our_swapchain_image_views,
+            self.swapchain,
+        );
+
+        // re-create swapchain
+        let ret = create_swapchain(
+            self.physical_device,
+            &self.surface_loader,
+            self.surface,
+            &self.swapchain_creator,
+        );
+
+        self.swapchain = ret.0;
+        self.swapchain_images = ret.1;
+        self.swapchain_dims = ret.2;
+
+        // re-create image views
+        self.swapchain_image_views =
+            create_swapchain_image_views(&self.device, &self.swapchain_images);
+
+        // re-create framebuffers
+        // framebuffer creation
+        self.framebuffers = create_framebuffers(
+            &self.device,
+            self.render_pass,
+            self.swapchain_dims,
+            &self.swapchain_image_views,
+        );
+
+        self.must_recreate_swapchain = false;
+    }
+
+    fn process_events(&mut self) -> bool {
+        // returns whether a quit event has been received
+
+        let mut exit = false;
+
+        // necessary because the borrow checker can't figure out that
+        // self.events_loop.poll_events() doesn't borrow all of self
+        let event_send = &self.event_send;
+        self.events_loop.poll_events(|ev| match ev {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => exit = true,
+            Event::WindowEvent { event, .. } => event_send.send(event).unwrap(),
+            _ => {}
+        });
+
+        exit
+    }
+
+    fn cleanup_prev_frame(&mut self) {
+        let frame = &self.flying_frames[self.flying_frame_idx.unwrap()];
+
+        let render_finished_fence = frame.render_finished_fence;
+
+        // we can't use this sync set until whichever rendering was using it
+        // previously is finished, so wait for rendering to finished (use the
+        // fence because it's a GPU - CPU sync)
+        unsafe {
+            self.device
+                .wait_for_fences(&[render_finished_fence], true, std::u64::MAX)
+        }
+        .expect("Couldn't wait for previous sync set to finish rendering");
+
+        // since rendering has finished, we can free that command buffer
+        if let Some(command_buffer) = frame.command_buffer {
+            unsafe {
+                self.device
+                    .free_command_buffers(self.command_pool, &[command_buffer])
+            };
+        } else {
+            // should only happen when swapchain images are first used, panic
+            // otherwise
+            if self.frames_drawn >= MAX_FRAMES_IN_FLIGHT {
+                panic!(
+                    "No command buffer in flying frame on frame {}",
+                    self.frames_drawn
+                );
+            }
+        }
+    }
+
+    fn acquire_image(&mut self) {
+        // image_available_semaphore will be signalled once the swapchain image
+        // is actually available and not being displayed anymore -
+        // acquire_next_image will return the instant it knows which image index
+        // will be free next, so we need to wait on that semaphore
+        let image_available_semaphore =
+            self.flying_frames[self.flying_frame_idx.unwrap()].image_available_semaphore;
+        let acquire_result = unsafe {
+            self.swapchain_creator.acquire_next_image(
+                self.swapchain,
+                std::u64::MAX,
+                image_available_semaphore,
+                vk::Fence::null(),
+            )
+        };
+
+        self.acquired_image_idx = match acquire_result {
+            Ok((image_idx, _is_sub_optimal)) => Some(image_idx),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.must_recreate_swapchain = true;
+                None
+            }
+            Err(e) => panic!("Unexpected error during acquire_next_image: {}", e),
+        };
+    }
+
+    fn wait_on_acquired_image(&mut self) {
+        // because we might have more sync sets than swapchain images, it's
+        // possible another set of sync sets is still rendering to this
+        // swapchain image. by waiting on the fence associated with this
+        // swapchain image, we can ensure it really is available
+        if let Some(image_fence) = self.swapchain_fences[self.acquired_image_idx.unwrap() as usize]
+        {
+            unsafe {
+                self.device
+                    .wait_for_fences(&[image_fence], true, std::u64::MAX)
+            }
+            .expect("Couldn't wait for image_in_flight fence");
+        } else {
+            // this should only happen on the first MAX_FRAMES_IN_FLIGHT frames
+            // drawn, because at that point we will not yet have started using
+            // all sync sets
+
+            // if it happens afterwards, panic
+            if self.frames_drawn >= MAX_FRAMES_IN_FLIGHT {
+                panic!(
+                    "No fence for this swapchain image at frame {}! image_idx: {}",
+                    self.frames_drawn,
+                    self.acquired_image_idx.unwrap()
+                );
+            }
+        }
+    }
+    fn update_mesh_buffers(&mut self, mesh: &Mesh<V>) {
+        // make sure we won't go past the memory we've allocated
+        let vertex_buffer_size = size_of_slice(&mesh.vertices);
+        let index_buffer_size = size_of_slice(&mesh.indices);
+
+        assert!(
+            vertex_buffer_size < self.vertex_buffer_capacity,
+            "Vertex buffers ({}) too small for vertex data ({})!",
+            self.vertex_buffer_capacity,
+            vertex_buffer_size
+        );
+
+        assert!(
+            index_buffer_size < self.index_buffer_capacity,
+            "Index buffers ({}) too small for index data ({})!",
+            self.index_buffer_capacity,
+            index_buffer_size
+        );
+
+        // even though we modify these, we don't need to mutably borrow because
+        // they are magical Vulkan pointers that don't care about lifetimes
+        let vertex_staging_buffer =
+            self.flying_frames[self.flying_frame_idx.unwrap()].vertex_staging_buffer;
+        let vertex_staging_buffer_memory =
+            self.flying_frames[self.flying_frame_idx.unwrap()].vertex_staging_buffer_memory;
+        let vertex_buffer = self.flying_frames[self.flying_frame_idx.unwrap()].vertex_buffer;
+        let index_buffer = self.flying_frames[self.flying_frame_idx.unwrap()].index_buffer;
+        let index_staging_buffer =
+            self.flying_frames[self.flying_frame_idx.unwrap()].index_staging_buffer;
+        let index_staging_buffer_memory =
+            self.flying_frames[self.flying_frame_idx.unwrap()].index_staging_buffer_memory;
+
+        let vbuf_copied_fence =
+            self.flying_frames[self.flying_frame_idx.unwrap()].vbuf_copied_fence;
+        let ibuf_copied_fence =
+            self.flying_frames[self.flying_frame_idx.unwrap()].ibuf_copied_fence;
+
+        // map and write vertex data to vertex staging buffer
+        if mesh.vertices.len() > 0 {
+            // reset the fences that will be used
+            unsafe {
+                self.device
+                    .reset_fences(&[vbuf_copied_fence, ibuf_copied_fence])
+            }
+            .expect("Couldn't reset vbuf_ and ibuf_copied_fence");
+
+            self.timer_write_vbuf.start();
+            write_to_cpu_accessible_buffer(
+                &self.device,
+                vertex_staging_buffer_memory,
+                &mesh.vertices,
+            );
+            self.timer_write_vbuf.stop();
+
+            // copy staging buffer to vertex buffer
+            self.timer_copy_vbuf.start();
+            let vbuf_command_buffer = copy_buffer(
+                &self.device,
+                self.queue,
+                self.command_pool,
+                vertex_staging_buffer,
+                vertex_buffer,
+                vertex_buffer_size,
+                vbuf_copied_fence,
+            );
+            self.timer_copy_vbuf.stop();
+
+            // map and write index data to staging buffer
+            self.timer_write_ibuf.start();
+            write_to_cpu_accessible_buffer(
+                &self.device,
+                index_staging_buffer_memory,
+                &mesh.indices,
+            );
+            self.timer_write_ibuf.stop();
+
+            // copy staging buffer to index buffer
+            self.timer_copy_ibuf.start();
+            let ibuf_command_buffer = copy_buffer(
+                &self.device,
+                self.queue,
+                self.command_pool,
+                index_staging_buffer,
+                index_buffer,
+                index_buffer_size,
+                ibuf_copied_fence,
+            );
+            self.timer_copy_ibuf.stop();
+
+            self.timer_copy_complete.start();
+            // before we submit, wait for both copy operations to finish
+            unsafe {
+                self.device.wait_for_fences(
+                    &[vbuf_copied_fence, ibuf_copied_fence],
+                    true,
+                    std::u64::MAX,
+                )
+            }
+            .expect("Couldn't wait for vertex and index buffer to finish copying");
+            self.timer_copy_complete.stop();
+
+            // free the command buffers used to copy
+            unsafe {
+                self.device.free_command_buffers(
+                    self.command_pool,
+                    &[vbuf_command_buffer, ibuf_command_buffer],
+                )
+            };
+        }
+    }
+
+    fn create_command_buffer(&mut self, index_count: u32) {
+        let vertex_buffer = self.flying_frames[self.flying_frame_idx.unwrap()].vertex_buffer;
+        let index_buffer = self.flying_frames[self.flying_frame_idx.unwrap()].index_buffer;
+
+        self.timer_create_cbuf.start();
+        let command_buffer = create_command_buffer(
+            &self.device,
+            self.render_pass,
+            self.pipeline,
+            self.command_pool,
+            self.framebuffers[self.acquired_image_idx.unwrap() as usize],
+            self.swapchain_dims,
+            vertex_buffer,
+            index_buffer,
+            index_count,
+        );
+        self.timer_create_cbuf.stop();
+
+        self.flying_frames[self.flying_frame_idx.unwrap()].command_buffer = Some(command_buffer);
+
+        // set the render_finished_fence associated with this swapchain image to
+        // the fence that will be signalled when we finish rendering - in other
+        // words, "We're using this image! Don't touch it till we finish."
+        let render_finished_fence =
+            self.flying_frames[self.flying_frame_idx.unwrap()].render_finished_fence;
+        self.swapchain_fences[self.acquired_image_idx.unwrap() as usize] =
+            Some(render_finished_fence);
+    }
+
+    fn submit_command_buffer(&mut self) {
+        let image_available_semaphore =
+            self.flying_frames[self.flying_frame_idx.unwrap()].image_available_semaphore;
+        let render_finished_semaphore =
+            self.flying_frames[self.flying_frame_idx.unwrap()].render_finished_semaphore;
+        let render_finished_fence =
+            self.flying_frames[self.flying_frame_idx.unwrap()].render_finished_fence;
+
+        let wait_semaphores = [image_available_semaphore];
+
+        // "Each entry in the waitStages array corresponds to the semaphore with
+        // the same index in pWaitSemaphores."
+        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+
+        let command_buffer = self.flying_frames[self.flying_frame_idx.unwrap()]
+            .command_buffer
+            .unwrap();
+        let cur_command_buffers = [command_buffer];
+
+        let signal_semaphores = [render_finished_semaphore];
+
+        let submit_info = vk::SubmitInfo {
+            s_type: vk::StructureType::SUBMIT_INFO,
+            p_next: ptr::null(),
+            wait_semaphore_count: 1,
+            p_wait_semaphores: wait_semaphores.as_ptr(),
+            p_wait_dst_stage_mask: wait_stages.as_ptr(),
+            command_buffer_count: 1,
+            p_command_buffers: cur_command_buffers.as_ptr(),
+            signal_semaphore_count: 1,
+            p_signal_semaphores: signal_semaphores.as_ptr(),
+        };
+
+        self.timer_draw.start();
+
+        // somebody else was previously using this fence and we waited until it
+        // was signalled (operation completed). now we need to reset it, because
+        // we aren't yet done but the fence says we are.
+        unsafe { self.device.reset_fences(&[render_finished_fence]) }
+            .expect("Couldn't reset render_finished_fence");
+
+        let submissions = [submit_info];
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submissions, render_finished_fence)
+        }
+        .expect("Couldn't submit command buffer");
+    }
+
+    fn present(&mut self) {
+        let swapchains = [self.swapchain];
+        let image_indices = [self.acquired_image_idx.unwrap()];
+
+        let render_finished_semaphore =
+            self.flying_frames[self.flying_frame_idx.unwrap()].render_finished_semaphore;
+        let signal_semaphores = [render_finished_semaphore];
+
+        let present_info = vk::PresentInfoKHR {
+            s_type: vk::StructureType::PRESENT_INFO_KHR,
+            p_next: ptr::null(),
+            wait_semaphore_count: 1,
+            p_wait_semaphores: signal_semaphores.as_ptr(),
+            swapchain_count: 1,
+            p_swapchains: swapchains.as_ptr(),
+            p_image_indices: image_indices.as_ptr(),
+            p_results: ptr::null_mut(),
+        };
+
+        match unsafe {
+            self.swapchain_creator
+                .queue_present(self.queue, &present_info)
+        } {
+            Ok(_idk_what_this_is) => (),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.must_recreate_swapchain = true;
+            }
+            Err(e) => panic!("Unexpected error during queue_present: {}", e),
+        };
+
+        self.frames_drawn += 1;
+    }
     pub fn cleanup(mut self) {
         unsafe { self.device.device_wait_idle() }.expect("Couldn't wait for device to become idle");
 
@@ -1080,10 +1147,7 @@ fn create_swapchain(
     (swapchain, images, dimensions)
 }
 
-fn create_swapchain_image_views(
-    device: &Device,
-    images: &[vk::Image],
-) -> Vec<vk::ImageView> {
+fn create_swapchain_image_views(device: &Device, images: &[vk::Image]) -> Vec<vk::ImageView> {
     images
         .iter()
         .map(|image| {
