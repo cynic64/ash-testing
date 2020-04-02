@@ -305,7 +305,9 @@ pub fn main() {
         crossbeam_channel::unbounded();
 
     // spawn it
-    let mesh_gen_handle = std::thread::spawn(move || mesh_thread(mesh_send, event_recv, hidpi_factor, swapchain_dims));
+    let mesh_gen_handle = std::thread::spawn(move || {
+        mesh_thread(mesh_send, event_recv, hidpi_factor, swapchain_dims)
+    });
 
     let mut renderer = Renderer::new(
         device.clone(),
@@ -356,7 +358,12 @@ pub fn main() {
     }
 }
 
-fn mesh_thread(mesh_send: Sender<Mesh<Vertex>>, event_recv: Receiver<WindowEvent>, hidpi_factor: f64, swapchain_dims: vk::Extent2D) {
+fn mesh_thread(
+    mesh_send: Sender<Mesh<Vertex>>,
+    event_recv: Receiver<WindowEvent>,
+    hidpi_factor: f64,
+    swapchain_dims: vk::Extent2D,
+) {
     let mut timer = LoopTimer::new("Mesh generation".to_string());
 
     let mut points = if DEBUG_GENERATE_POINTS {
@@ -387,7 +394,7 @@ fn mesh_thread(mesh_send: Sender<Mesh<Vertex>>, event_recv: Receiver<WindowEvent
                         last_used_mouse_pos = mouse_pos;
                     }
                 }
-            },
+            }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
@@ -399,8 +406,7 @@ fn mesh_thread(mesh_send: Sender<Mesh<Vertex>>, event_recv: Receiver<WindowEvent
             _ => {}
         });
 
-        if mouse_down {
-        }
+        if mouse_down {}
 
         let mesh = create_mesh(&points);
 
@@ -591,30 +597,6 @@ fn create_pipeline<D: DeviceV1_0>(
         primitive_restart_enable: vk::FALSE,
     };
 
-    let viewports = [vk::Viewport {
-        x: 0.0,
-        y: 0.0,
-        width: swapchain_dims.width as f32,
-        height: swapchain_dims.height as f32,
-        min_depth: 0.0,
-        max_depth: 1.0,
-    }];
-
-    let scissors = [vk::Rect2D {
-        offset: vk::Offset2D { x: 0, y: 0 },
-        extent: swapchain_dims,
-    }];
-
-    let viewport_state = vk::PipelineViewportStateCreateInfo {
-        s_type: vk::StructureType::PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: vk::PipelineViewportStateCreateFlags::empty(),
-        viewport_count: viewports.len() as u32,
-        p_viewports: viewports.as_ptr(),
-        scissor_count: scissors.len() as u32,
-        p_scissors: scissors.as_ptr(),
-    };
-
     let pipeline_rasterization_info = vk::PipelineRasterizationStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
         p_next: ptr::null(),
@@ -661,6 +643,16 @@ fn create_pipeline<D: DeviceV1_0>(
             | vk::ColorComponentFlags::A,
     }];
 
+    let viewport_state_info = vk::PipelineViewportStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineViewportStateCreateFlags::empty(),
+        viewport_count: 1,
+        p_viewports: ptr::null(),
+        scissor_count: 1,
+        p_scissors: ptr::null(),
+    };
+
     // color blending settings for the whole pipleine
     let pipeline_color_blend_info = vk::PipelineColorBlendStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
@@ -673,6 +665,16 @@ fn create_pipeline<D: DeviceV1_0>(
         blend_constants: [0.0, 0.0, 0.0, 0.0], // optional
     };
 
+    // dynamic state
+    let dynamic_state_flags = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state_info = vk::PipelineDynamicStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: vk::PipelineDynamicStateCreateFlags::empty(),
+        dynamic_state_count: dynamic_state_flags.len() as u32,
+        p_dynamic_states: dynamic_state_flags.as_ptr(),
+    };
+
     let pipeline_infos = [vk::GraphicsPipelineCreateInfo {
         s_type: vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO,
         p_next: ptr::null(),
@@ -682,12 +684,12 @@ fn create_pipeline<D: DeviceV1_0>(
         p_vertex_input_state: &pipeline_vertex_input_info,
         p_input_assembly_state: &pipeline_input_assembly_info,
         p_tessellation_state: ptr::null(),
-        p_viewport_state: &viewport_state,
+        p_viewport_state: &viewport_state_info,
         p_rasterization_state: &pipeline_rasterization_info,
         p_multisample_state: &pipeline_multisample_info,
         p_depth_stencil_state: ptr::null(),
         p_color_blend_state: &pipeline_color_blend_info,
-        p_dynamic_state: ptr::null(),
+        p_dynamic_state: &dynamic_state_info,
         layout: pipeline_layout,
         render_pass,
         subpass: 0,
@@ -807,41 +809,6 @@ fn is_phys_dev_suitable(instance: &ash::Instance, phys_dev: &vk::PhysicalDevice)
     });
 
     true
-}
-
-fn check_device_swapchain_caps(
-    surface_loader: &Surface,
-    physical_device: vk::PhysicalDevice,
-    surface: vk::SurfaceKHR,
-) -> vk::Extent2D {
-    // returns the current dimensions of the swapchain
-
-    let capabilities = unsafe {
-        surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
-    }
-    .expect("Couldn't get physical device surface capabilities");
-
-    let formats =
-        unsafe { surface_loader.get_physical_device_surface_formats(physical_device, surface) }
-            .expect("Couldn't get physical device surface formats");
-
-    let present_modes = unsafe {
-        surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
-    }
-    .expect("Couldn't get physical device surface present modes");
-
-    // we will request 3 swapchain images to avoid having to wait while one is
-    // being cleared or something, idk exactly
-    assert!(capabilities.min_image_count <= 3 && capabilities.max_image_count >= 3);
-
-    formats
-        .iter()
-        .find(|fmt| fmt.format == vk::Format::B8G8R8A8_UNORM)
-        .expect("Swapchain doesn't support B8G8R8A8_UNORM!");
-
-    assert!(present_modes.contains(&vk::PresentModeKHR::IMMEDIATE));
-
-    capabilities.current_extent
 }
 
 // many of these functions are ripped from https://github.com/bwasty/vulkan-tutorial-rs
@@ -1124,4 +1091,39 @@ fn create_swapchain_image_views<D: DeviceV1_0>(
                 .expect("Couldn't create image view info")
         })
         .collect()
+}
+
+fn check_device_swapchain_caps(
+    surface_loader: &Surface,
+    physical_device: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+) -> vk::Extent2D {
+    // returns the current dimensions of the swapchain
+
+    let capabilities = unsafe {
+        surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
+    }
+    .expect("Couldn't get physical device surface capabilities");
+
+    let formats =
+        unsafe { surface_loader.get_physical_device_surface_formats(physical_device, surface) }
+            .expect("Couldn't get physical device surface formats");
+
+    let present_modes = unsafe {
+        surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
+    }
+    .expect("Couldn't get physical device surface present modes");
+
+    // we will request 3 swapchain images to avoid having to wait while one is
+    // being cleared or something, idk exactly
+    assert!(capabilities.min_image_count <= 3 && capabilities.max_image_count >= 3);
+
+    formats
+        .iter()
+        .find(|fmt| fmt.format == vk::Format::B8G8R8A8_UNORM)
+        .expect("Swapchain doesn't support B8G8R8A8_UNORM!");
+
+    assert!(present_modes.contains(&vk::PresentModeKHR::IMMEDIATE));
+
+    capabilities.current_extent
 }

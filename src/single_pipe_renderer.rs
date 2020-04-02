@@ -13,6 +13,7 @@ use crate::{get_elapsed, size_of_slice, LoopTimer};
 
 pub struct Renderer<V> {
     device: Device,
+    physical_device: vk::PhysicalDevice,
     queue: vk::Queue,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
@@ -38,6 +39,22 @@ pub struct Renderer<V> {
     events_loop: EventsLoop,
     mesh_recv: Receiver<Mesh<V>>,
     event_send: Sender<WindowEvent>,
+
+    swapchain_fences: Vec<Option<vk::Fence>>,
+    frames_drawn: usize,
+    start_time: std::time::Instant,
+    mouse_pos: PixelPos,
+    mouse_down: bool,
+    last_sent_mouse_pos: PixelPos,
+
+    timer_mesh_wait: LoopTimer,
+    timer_draw: LoopTimer,
+    timer_write_vbuf: LoopTimer,
+    timer_copy_vbuf: LoopTimer,
+    timer_write_ibuf: LoopTimer,
+    timer_copy_ibuf: LoopTimer,
+    timer_copy_complete: LoopTimer,
+    timer_create_cbuf: LoopTimer,
 }
 
 pub struct Mesh<V> {
@@ -52,6 +69,8 @@ type VkPos = [f64; 2];
 type IndexType = u32;
 
 const MAX_FRAMES_IN_FLIGHT: usize = 4;
+const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
+const MAX_POINT_DIST: f64 = 10.0;
 
 // we cannot know which image will be used before calling acquire_next_image,
 // for which we already need a semaphore ready for it to signal.
@@ -124,8 +143,21 @@ impl<V> Renderer<V> {
         // command pool
         let command_pool = create_command_pool(&device, queue_family_index);
 
+        // timers
+        let timer_mesh_wait = LoopTimer::new("Waiting on mesh gen".to_string());
+        let timer_draw = LoopTimer::new("Drawing".to_string());
+        let timer_write_vbuf = LoopTimer::new("Write vbuf".to_string());
+        let timer_copy_vbuf = LoopTimer::new("Copy vbuf".to_string());
+        let timer_write_ibuf = LoopTimer::new("Write ibuf".to_string());
+        let timer_copy_ibuf = LoopTimer::new("Copy ibuf".to_string());
+        let timer_copy_complete = LoopTimer::new("Copy completion".to_string());
+        let timer_create_cbuf = LoopTimer::new("Create command buffer".to_string());
+
+        let swapchain_image_count = swapchain_images.len();
+
         Self {
             device: device.clone(),
+            physical_device,
             queue,
             must_recreate_swapchain: false,
             framebuffers,
@@ -152,42 +184,26 @@ impl<V> Renderer<V> {
 
             mesh_recv,
             event_send,
+
+            swapchain_fences: vec![None; swapchain_image_count],
+            frames_drawn: 0,
+            start_time: std::time::Instant::now(),
+            mouse_pos: [-9999.0, -9999.0],
+            mouse_down: false,
+            last_sent_mouse_pos: [-9999.0, -9999.0],
+
+            timer_mesh_wait,
+            timer_draw,
+            timer_write_vbuf,
+            timer_copy_vbuf,
+            timer_write_ibuf,
+            timer_copy_ibuf,
+            timer_copy_complete,
+            timer_create_cbuf,
         }
     }
 
     pub fn start(&mut self) {
-        // used to check whether rendering to a swapchain image has finished,
-        // necessary because we have more sync sets than swapchain images
-        let mut swapchain_fences: Vec<Option<vk::Fence>> = vec![None; self.swapchain_images.len()];
-
-        // used to calculate FPS and keep track of which sync set to use next
-        // (remember, it's independent from which swapchain image is being used)
-        let mut frames_drawn = 0;
-        let start_time = std::time::Instant::now();
-
-        // winit does not have a function to get the current mouse position, so
-        // instead we keep track of it and update it every time the mouse moves
-        let mut mouse_pos = [0.0, 0.0];
-
-        // also track whether the LMB is down or not
-        let mut mouse_down = false;
-
-        // and last location we sent to the mesh-generating thread (because sending
-        // locations very close together is pointless)
-        let mut last_sent_mouse_pos: PixelPos = [-9999.0, -9999.0];
-        // at least 10 pixels in between every sending of the mouse position
-        let mouse_pos_send_thresh_dist = 10.0;
-
-        // timers
-        let mut timer_mesh_wait = LoopTimer::new("Waiting on mesh gen".to_string());
-        let mut timer_draw = LoopTimer::new("Drawing".to_string());
-        let mut timer_write_vbuf = LoopTimer::new("Write vbuf".to_string());
-        let mut timer_copy_vbuf = LoopTimer::new("Copy vbuf".to_string());
-        let mut timer_write_ibuf = LoopTimer::new("Write ibuf".to_string());
-        let mut timer_copy_ibuf = LoopTimer::new("Copy ibuf".to_string());
-        let mut timer_copy_complete = LoopTimer::new("Copy completion".to_string());
-        let mut timer_create_cbuf = LoopTimer::new("Create command buffer".to_string());
-
         loop {
             if self.must_recreate_swapchain {
                 unsafe { self.device.device_wait_idle() }
@@ -207,13 +223,11 @@ impl<V> Renderer<V> {
                     &self.device,
                     &self.swapchain_creator,
                     our_framebuffers,
-                    self.pipeline,
                     our_swapchain_image_views,
                     self.swapchain,
                 );
 
                 // re-create swapchain
-                /*
                 let ret = create_swapchain(
                     self.physical_device,
                     &self.surface_loader,
@@ -224,25 +238,9 @@ impl<V> Renderer<V> {
                 self.swapchain = ret.0;
                 self.swapchain_images = ret.1;
                 self.swapchain_dims = ret.2;
-                */
 
                 // re-create image views
-                /*
                 self.swapchain_image_views = create_swapchain_image_views(&self.device, &self.swapchain_images);
-                */
-
-                // re-create graphics pipeline
-                /*
-                self.pipeline = create_pipeline(
-                    &self.device,
-                    self.render_pass,
-                    self.pipeline_layout,
-                    self.swapchain_dims,
-                    self.shader_stages,
-                    &self.binding_descriptions,
-                    &self.attribute_descriptions,
-                );
-                */
 
                 // re-create framebuffers
                 // framebuffer creation
@@ -274,7 +272,7 @@ impl<V> Renderer<V> {
                 break;
             }
 
-            let flying_frame_idx = frames_drawn % MAX_FRAMES_IN_FLIGHT;
+            let flying_frame_idx = self.frames_drawn % MAX_FRAMES_IN_FLIGHT;
             let frame = &self.flying_frames[flying_frame_idx];
 
             let image_available_semaphore = frame.image_available_semaphore;
@@ -299,10 +297,10 @@ impl<V> Renderer<V> {
             } else {
                 // should only happen when swapchain images are first used, panic
                 // otherwise
-                if frames_drawn >= MAX_FRAMES_IN_FLIGHT {
+                if self.frames_drawn >= MAX_FRAMES_IN_FLIGHT {
                     panic!(
                         "No command buffer in flying frame on frame {}",
-                        frames_drawn
+                        self.frames_drawn
                     );
                 }
             }
@@ -333,7 +331,7 @@ impl<V> Renderer<V> {
             // possible another set of sync sets is still rendering to this
             // swapchain image. by waiting on the fence associated with this
             // swapchain image, we can ensure it really is available
-            if let Some(image_fence) = swapchain_fences[image_idx as usize] {
+            if let Some(image_fence) = self.swapchain_fences[image_idx as usize] {
                 unsafe {
                     self.device
                         .wait_for_fences(&[image_fence], true, std::u64::MAX)
@@ -345,24 +343,24 @@ impl<V> Renderer<V> {
                 // all sync sets
 
                 // if it happens afterwards, panic
-                if frames_drawn >= MAX_FRAMES_IN_FLIGHT {
+                if self.frames_drawn >= MAX_FRAMES_IN_FLIGHT {
                     panic!(
                         "No fence for this swapchain image at frame {}! image_idx: {}",
-                        frames_drawn, image_idx
+                        self.frames_drawn, image_idx
                     );
                 }
             }
 
-            timer_draw.stop();
+            self.timer_draw.stop();
 
-            timer_mesh_wait.start();
+            self.timer_mesh_wait.start();
             let mesh = self.mesh_recv.recv().expect("Error when receiving mesh");
-            timer_mesh_wait.stop();
+            self.timer_mesh_wait.stop();
 
             // set the render_finished_fence associated with this swapchain image to
             // the fence that will be signalled when we finish rendering - in other
             // words, "We're using this image! Don't touch it till we finish."
-            swapchain_fences[image_idx as usize] = Some(render_finished_fence);
+            self.swapchain_fences[image_idx as usize] = Some(render_finished_fence);
 
             // change mesh data on GPU
 
@@ -408,16 +406,16 @@ impl<V> Renderer<V> {
                 }
                 .expect("Couldn't reset vbuf_ and ibuf_copied_fence");
 
-                timer_write_vbuf.start();
+                self.timer_write_vbuf.start();
                 write_to_cpu_accessible_buffer(
                     &self.device,
                     vertex_staging_buffer_memory,
                     &mesh.vertices,
                 );
-                timer_write_vbuf.stop();
+                self.timer_write_vbuf.stop();
 
                 // copy staging buffer to vertex buffer
-                timer_copy_vbuf.start();
+                self.timer_copy_vbuf.start();
                 let vbuf_command_buffer = copy_buffer(
                     &self.device,
                     self.queue,
@@ -427,19 +425,19 @@ impl<V> Renderer<V> {
                     vertex_buffer_size,
                     vbuf_copied_fence,
                 );
-                timer_copy_vbuf.stop();
+                self.timer_copy_vbuf.stop();
 
                 // map and write index data to staging buffer
-                timer_write_ibuf.start();
+                self.timer_write_ibuf.start();
                 write_to_cpu_accessible_buffer(
                     &self.device,
                     index_staging_buffer_memory,
                     &mesh.indices,
                 );
-                timer_write_ibuf.stop();
+                self.timer_write_ibuf.stop();
 
                 // copy staging buffer to index buffer
-                timer_copy_ibuf.start();
+                self.timer_copy_ibuf.start();
                 let ibuf_command_buffer = copy_buffer(
                     &self.device,
                     self.queue,
@@ -449,13 +447,13 @@ impl<V> Renderer<V> {
                     index_buffer_size,
                     ibuf_copied_fence,
                 );
-                timer_copy_ibuf.stop();
+                self.timer_copy_ibuf.stop();
 
                 copy_command_buffers = Some((vbuf_command_buffer, ibuf_command_buffer));
             }
 
             // create command buffer
-            timer_create_cbuf.start();
+            self.timer_create_cbuf.start();
             let command_buffer = create_command_buffer(
                 &self.device,
                 self.render_pass,
@@ -467,13 +465,13 @@ impl<V> Renderer<V> {
                 index_buffer,
                 mesh.indices.len() as u32,
             );
-            timer_create_cbuf.stop();
+            self.timer_create_cbuf.stop();
 
-            self.flying_frames[frames_drawn % MAX_FRAMES_IN_FLIGHT].command_buffer =
+            self.flying_frames[self.frames_drawn % MAX_FRAMES_IN_FLIGHT].command_buffer =
                 Some(command_buffer);
 
             if let Some((vbuf_cbuf, ibuf_cbuf)) = copy_command_buffers {
-                timer_copy_complete.start();
+                self.timer_copy_complete.start();
                 // before we submit, wait for both copy operations to finish
                 unsafe {
                     self.device.wait_for_fences(
@@ -483,7 +481,7 @@ impl<V> Renderer<V> {
                     )
                 }
                 .expect("Couldn't wait for vertex and index buffer to finish copying");
-                timer_copy_complete.stop();
+                self.timer_copy_complete.stop();
 
                 // free the command buffers used to copy
                 unsafe {
@@ -515,7 +513,7 @@ impl<V> Renderer<V> {
                 p_signal_semaphores: signal_semaphores.as_ptr(),
             };
 
-            timer_draw.start();
+            self.timer_draw.start();
 
             // somebody else was previously using this fence and we waited until it
             // was signalled (operation completed). now we need to reset it, because
@@ -557,23 +555,23 @@ impl<V> Renderer<V> {
                 Err(e) => panic!("Unexpected error during queue_present: {}", e),
             };
 
-            frames_drawn += 1;
+            self.frames_drawn += 1;
         }
 
-        println!("FPS: {:.2}", frames_drawn as f64 / get_elapsed(start_time));
+        println!("FPS: {:.2}", self.frames_drawn as f64 / get_elapsed(self.start_time));
         println!(
             "Average delta in ms: {:.5}",
-            get_elapsed(start_time) / frames_drawn as f64 * 1_000.0
+            get_elapsed(self.start_time) / self.frames_drawn as f64 * 1_000.0
         );
 
-        timer_draw.print();
-        timer_mesh_wait.print();
-        timer_write_vbuf.print();
-        timer_copy_vbuf.print();
-        timer_write_ibuf.print();
-        timer_copy_ibuf.print();
-        timer_copy_complete.print();
-        timer_create_cbuf.print();
+        self.timer_draw.print();
+        self.timer_mesh_wait.print();
+        self.timer_write_vbuf.print();
+        self.timer_copy_vbuf.print();
+        self.timer_write_ibuf.print();
+        self.timer_copy_ibuf.print();
+        self.timer_copy_complete.print();
+        self.timer_create_cbuf.print();
     }
 
     pub fn cleanup(mut self) {
@@ -612,10 +610,11 @@ impl<V> Renderer<V> {
                 &self.device,
                 &self.swapchain_creator,
                 self.framebuffers,
-                self.pipeline,
                 self.swapchain_image_views,
                 self.swapchain,
             );
+
+            self.device.destroy_pipeline(self.pipeline, None);
 
             self.device.destroy_command_pool(self.command_pool, None);
         }
@@ -817,7 +816,6 @@ fn cleanup_swapchain(
     device: &Device,
     swapchain_creator: &Swapchain,
     framebuffers: Vec<vk::Framebuffer>,
-    pipeline: vk::Pipeline,
     swapchain_image_views: Vec<vk::ImageView>,
     swapchain: vk::SwapchainKHR,
 ) {
@@ -828,7 +826,6 @@ fn cleanup_swapchain(
         framebuffers
             .iter()
             .for_each(|fb| device.destroy_framebuffer(*fb, None));
-        device.destroy_pipeline(pipeline, None);
         swapchain_creator.destroy_swapchain(swapchain, None);
     }
 }
@@ -956,6 +953,21 @@ fn create_command_buffer(
     let command_buffer = unsafe { device.allocate_command_buffers(&command_buffer_alloc_info) }
         .expect("Couldn't allocate command buffers")[0];
 
+    // create viewport and scissors
+    let viewports = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: dimensions.width as f32,
+        height: dimensions.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+
+    let scissors = [vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: dimensions,
+    }];
+
     // begin command buffer
     let command_buffer_begin_info = vk::CommandBufferBeginInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
@@ -966,6 +978,14 @@ fn create_command_buffer(
 
     unsafe { device.begin_command_buffer(command_buffer, &command_buffer_begin_info) }
         .expect("Couldn't begin command buffer");
+
+    // Set viewports and scissors
+    unsafe {
+        device.cmd_set_viewport(command_buffer, 0, &viewports);
+    }
+    unsafe {
+        device.cmd_set_scissor(command_buffer, 0, &scissors);
+    }
 
     // Start render pass
     let clear_values = [vk::ClearValue {
@@ -1014,4 +1034,118 @@ fn create_command_buffer(
     unsafe { device.end_command_buffer(command_buffer) }.expect("Couldn't record command buffer!");
 
     command_buffer
+}
+
+fn create_swapchain(
+    physical_device: vk::PhysicalDevice,
+    surface_loader: &Surface,
+    surface: vk::SurfaceKHR,
+    swapchain_creator: &Swapchain,
+) -> (vk::SwapchainKHR, Vec<vk::Image>, vk::Extent2D) {
+    // check device swapchain capabilties (not just that it has the extension,
+    // also formats and stuff like that)
+    // also returns what dimensions the swapchain should initially be created at
+    let dimensions = check_device_swapchain_caps(surface_loader, physical_device, surface);
+
+    // for now, the format is fixed - might be good to change later.
+
+    // create swapchain
+    let create_info = vk::SwapchainCreateInfoKHR {
+        s_type: vk::StructureType::SWAPCHAIN_CREATE_INFO_KHR,
+        p_next: ptr::null(),
+        flags: vk::SwapchainCreateFlagsKHR::empty(),
+        surface: surface,
+        min_image_count: 2,
+        image_format: SWAPCHAIN_FORMAT,
+        image_color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+        image_extent: dimensions,
+        image_array_layers: 1,
+        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        image_sharing_mode: vk::SharingMode::EXCLUSIVE,
+        queue_family_index_count: 0,
+        p_queue_family_indices: ptr::null(),
+        pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
+        composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
+        present_mode: vk::PresentModeKHR::IMMEDIATE,
+        clipped: vk::TRUE,
+        old_swapchain: vk::SwapchainKHR::null(),
+    };
+
+    let swapchain = unsafe { swapchain_creator.create_swapchain(&create_info, None) }
+        .expect("Couldn't create swapchain");
+
+    let images = unsafe { swapchain_creator.get_swapchain_images(swapchain) }
+        .expect("Couldn't get swapchain images");
+
+    (swapchain, images, dimensions)
+}
+
+fn create_swapchain_image_views(
+    device: &Device,
+    images: &[vk::Image],
+) -> Vec<vk::ImageView> {
+    images
+        .iter()
+        .map(|image| {
+            let iv_info = vk::ImageViewCreateInfo {
+                s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+                p_next: ptr::null(),
+                flags: vk::ImageViewCreateFlags::empty(),
+                image: *image,
+                view_type: vk::ImageViewType::TYPE_2D,
+                format: SWAPCHAIN_FORMAT,
+                components: vk::ComponentMapping {
+                    r: vk::ComponentSwizzle::IDENTITY,
+                    g: vk::ComponentSwizzle::IDENTITY,
+                    b: vk::ComponentSwizzle::IDENTITY,
+                    a: vk::ComponentSwizzle::IDENTITY,
+                },
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+            };
+
+            unsafe { device.create_image_view(&iv_info, None) }
+                .expect("Couldn't create image view info")
+        })
+        .collect()
+}
+
+fn check_device_swapchain_caps(
+    surface_loader: &Surface,
+    physical_device: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+) -> vk::Extent2D {
+    // returns the current dimensions of the swapchain
+
+    let capabilities = unsafe {
+        surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
+    }
+    .expect("Couldn't get physical device surface capabilities");
+
+    let formats =
+        unsafe { surface_loader.get_physical_device_surface_formats(physical_device, surface) }
+            .expect("Couldn't get physical device surface formats");
+
+    let present_modes = unsafe {
+        surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
+    }
+    .expect("Couldn't get physical device surface present modes");
+
+    // we will request 3 swapchain images to avoid having to wait while one is
+    // being cleared or something, idk exactly
+    assert!(capabilities.min_image_count <= 3 && capabilities.max_image_count >= 3);
+
+    formats
+        .iter()
+        .find(|fmt| fmt.format == vk::Format::B8G8R8A8_UNORM)
+        .expect("Swapchain doesn't support B8G8R8A8_UNORM!");
+
+    assert!(present_modes.contains(&vk::PresentModeKHR::IMMEDIATE));
+
+    capabilities.current_extent
 }
