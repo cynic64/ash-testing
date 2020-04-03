@@ -420,6 +420,7 @@ impl<V> Renderer<V> {
             }
         }
     }
+
     fn update_mesh_buffers(&mut self, mesh: &Mesh<V>) {
         // make sure we won't go past the memory we've allocated
         let vertex_buffer_size = size_of_slice(&mesh.vertices);
