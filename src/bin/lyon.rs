@@ -56,7 +56,7 @@ const KINKINESS: f64 = 0.2;
 // number of pixels allowed to be skipped in between points used
 const MAX_POINT_DIST: f64 = 10.0;
 
-const DEBUG_GENERATE_POINTS: bool = false;
+const DEBUG_GENERATE_POINTS: bool = true;
 
 // range from 0.0 .. screen size
 type PixelPos = [f64; 2];
@@ -336,7 +336,7 @@ pub fn main() {
     );
 
     renderer.start();
-    renderer.cleanup();
+    // renderer.cleanup();
 
     println!("waiting on mesh thread");
     mesh_gen_handle.join().unwrap();
