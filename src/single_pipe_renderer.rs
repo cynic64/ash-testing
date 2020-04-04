@@ -6,10 +6,13 @@ use ash::{vk, Device, Instance};
 
 use crossbeam_channel::{Receiver, Sender};
 
-use std::ptr;
+use log::{debug, error, info, trace, warn};
+
 use winit::{dpi::LogicalPosition, ElementState, Event, EventsLoop, MouseButton, WindowEvent};
 
 use crate::{get_elapsed, size_of_slice, LoopTimer};
+
+use std::ptr;
 
 pub struct Renderer<V> {
     device: Device,
@@ -70,6 +73,8 @@ const MAX_FRAMES_IN_FLIGHT: usize = 4;
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 const MAX_POINT_DIST: f64 = 10.0;
 
+const LOG_LEVEL: log::LevelFilter = log::LevelFilter::Trace;
+
 struct FlyingFrame {
     device: Device,
     queue: vk::Queue,
@@ -110,6 +115,8 @@ impl<V> Renderer<V> {
         mesh_recv: Receiver<Mesh<V>>,
         event_send: Sender<WindowEvent>,
     ) -> Self {
+        setup_logger();
+
         println!("Maximum frames in flight: {} ", MAX_FRAMES_IN_FLIGHT);
 
         // framebuffer creation
@@ -124,7 +131,17 @@ impl<V> Renderer<V> {
         let command_pool = create_command_pool(&device, queue_family_index);
 
         let flying_frames = (0..MAX_FRAMES_IN_FLIGHT)
-            .map(|_| FlyingFrame::new(device.clone(), queue, render_pass, pipeline, swapchain_creator.clone(), swapchain, command_pool))
+            .map(|_| {
+                FlyingFrame::new(
+                    device.clone(),
+                    queue,
+                    render_pass,
+                    pipeline,
+                    swapchain_creator.clone(),
+                    swapchain,
+                    command_pool,
+                )
+            })
             .collect();
 
         // timers
@@ -186,6 +203,8 @@ impl<V> Renderer<V> {
 
     pub fn start(&mut self) {
         loop {
+            info!("Begin new frame");
+
             if self.must_recreate_swapchain {
                 self.recreate_swapchain();
             }
@@ -195,9 +214,12 @@ impl<V> Renderer<V> {
             }
 
             // wait for new mesh to be sent
+            info!("Waiting for mesh...");
             let mesh = self.mesh_recv.recv().unwrap();
+            info!("Got mesh");
 
             // create buffers
+            info!("Creating buffers...");
             let (vertex_buffer, vertex_buffer_memory) = create_buffer(
                 &self.device,
                 self.device_memory_properties,
@@ -218,16 +240,33 @@ impl<V> Renderer<V> {
             write_to_cpu_accessible_buffer(&self.device, vertex_buffer_memory, &mesh.vertices);
             write_to_cpu_accessible_buffer(&self.device, index_buffer_memory, &mesh.indices);
 
+            info!("Done creating buffers");
+
             let index_count = mesh.indices.len() as u32;
 
             let ff_idx = self.frames_drawn % MAX_FRAMES_IN_FLIGHT;
 
-            let image_available_semaphore = self.flying_frames[ff_idx].get_image_available_semaphore();
+            // wait for chosen FlyingFrame's previous rendering operation to
+            // complete
+            info!("Waiting for FF to become available...");
+            self.flying_frames[ff_idx].wait();
+            info!("Done waiting for FF");
+
+            let image_available_semaphore =
+                self.flying_frames[ff_idx].get_image_available_semaphore();
 
             let image_index = self.acquire_image(image_available_semaphore);
             let framebuffer = self.framebuffers[image_index as usize];
 
-            self.flying_frames[ff_idx].draw(image_index, vertex_buffer, index_buffer, index_count, framebuffer, self.swapchain_dims);
+            info!("Drawing...");
+            self.flying_frames[ff_idx].draw(
+                image_index,
+                vertex_buffer,
+                index_buffer,
+                index_count,
+                framebuffer,
+                self.swapchain_dims,
+            );
         }
 
         println!(
@@ -340,7 +379,15 @@ impl<V> Renderer<V> {
 }
 
 impl FlyingFrame {
-    pub fn new(device: Device, queue: vk::Queue, render_pass: vk::RenderPass, pipeline: vk::Pipeline, swapchain_creator: Swapchain, swapchain: vk::SwapchainKHR, command_pool: vk::CommandPool) -> Self {
+    pub fn new(
+        device: Device,
+        queue: vk::Queue,
+        render_pass: vk::RenderPass,
+        pipeline: vk::Pipeline,
+        swapchain_creator: Swapchain,
+        swapchain: vk::SwapchainKHR,
+        command_pool: vk::CommandPool,
+    ) -> Self {
         // create info for semaphores and fences
         let semaphore_info = vk::SemaphoreCreateInfo {
             s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
@@ -354,13 +401,11 @@ impl FlyingFrame {
             flags: vk::FenceCreateFlags::SIGNALED,
         };
 
-        let image_available_semaphore =
-            unsafe { device.create_semaphore(&semaphore_info, None) }
-                .expect("Couldn't create semaphore");
+        let image_available_semaphore = unsafe { device.create_semaphore(&semaphore_info, None) }
+            .expect("Couldn't create semaphore");
 
-        let render_finished_semaphore =
-            unsafe { device.create_semaphore(&semaphore_info, None) }
-                .expect("Couldn't create semaphore");
+        let render_finished_semaphore = unsafe { device.create_semaphore(&semaphore_info, None) }
+            .expect("Couldn't create semaphore");
 
         let render_finished_fence =
             unsafe { device.create_fence(&fence_info, None) }.expect("Couldn't create fence");
@@ -380,7 +425,15 @@ impl FlyingFrame {
         }
     }
 
-    pub fn draw(&mut self, image_index: u32, vertex_buffer: vk::Buffer, index_buffer: vk::Buffer, index_count: u32, framebuffer: vk::Framebuffer, dimensions: vk::Extent2D) {
+    pub fn draw(
+        &mut self,
+        image_index: u32,
+        vertex_buffer: vk::Buffer,
+        index_buffer: vk::Buffer,
+        index_count: u32,
+        framebuffer: vk::Framebuffer,
+        dimensions: vk::Extent2D,
+    ) {
         let command_buffer = create_command_buffer(
             &self.device,
             self.render_pass,
@@ -458,6 +511,11 @@ impl FlyingFrame {
     }
 
     pub fn wait(&mut self) {
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.render_finished_fence], true, std::u64::MAX)
+        }
+        .expect("Couldn't wait for previous rendering operation to finish");
     }
 
     pub fn get_image_available_semaphore(&self) -> vk::Semaphore {
@@ -515,11 +573,10 @@ fn create_buffer(
         p_queue_family_indices: ptr::null(),
     };
 
-    let buffer = unsafe { device.create_buffer(&buffer_info, None) }
-        .expect("Couldn't create buffer");
+    let buffer =
+        unsafe { device.create_buffer(&buffer_info, None) }.expect("Couldn't create buffer");
 
-    let buffer_memory_requirements =
-        unsafe { device.get_buffer_memory_requirements(buffer) };
+    let buffer_memory_requirements = unsafe { device.get_buffer_memory_requirements(buffer) };
 
     let buffer_memory_type_index = find_memory_type(
         device_memory_properties,
@@ -540,8 +597,7 @@ fn create_buffer(
     let buffer_memory = unsafe { device.allocate_memory(&buffer_alloc_info, None) }
         .expect("Couldn't allocate buffer device memory");
 
-    unsafe { device.bind_buffer_memory(buffer, buffer_memory, 0) }
-        .expect("Couldn't bind buffer");
+    unsafe { device.bind_buffer_memory(buffer, buffer_memory, 0) }.expect("Couldn't bind buffer");
 
     (buffer, buffer_memory)
 }
@@ -662,11 +718,7 @@ fn copy_buffer(
     command_buffer
 }
 
-fn write_to_cpu_accessible_buffer<T>(
-    device: &Device,
-    buffer_memory: vk::DeviceMemory,
-    data: &[T],
-) {
+fn write_to_cpu_accessible_buffer<T>(device: &Device, buffer_memory: vk::DeviceMemory, data: &[T]) {
     let buffer_size = size_of_slice(data);
 
     unsafe {
@@ -896,4 +948,29 @@ fn check_device_swapchain_caps(
     assert!(present_modes.contains(&vk::PresentModeKHR::IMMEDIATE));
 
     capabilities.current_extent
+}
+
+fn setup_logger() -> Result<(), fern::InitError> {
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            /*
+            out.finish(format_args!(
+                "{}[{}][{}] {}",
+                chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S.%f]"),
+                record.target(),
+                record.level(),
+                message
+            ))
+            */
+            out.finish(format_args!(
+                "[{}][{}] {}",
+                chrono::Local::now().timestamp_nanos(),
+                record.level(),
+                message,
+            ))
+        })
+        .level(LOG_LEVEL)
+        .chain(fern::log_file("single-pipe-renderer.log")?)
+        .apply()?;
+    Ok(())
 }

@@ -533,7 +533,7 @@ fn create_debug_points() -> Vec<VkPos> {
     let mut rng = ChaCha20Rng::seed_from_u64(0);
     // with tolerance 0.0001, 4 points gives 792 indices and 300 points gives
     // 89,952
-    (0..4)
+    (0..300)
         .map(|_| {
             let x = rng.gen::<f64>() * 2.0 - 1.0;
             let y = rng.gen::<f64>() * 2.0 - 1.0;
