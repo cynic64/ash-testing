@@ -37,6 +37,7 @@ pub struct Renderer<V> {
     queue_family_index: u32,
     device_memory_properties: vk::PhysicalDeviceMemoryProperties,
     flying_frames: Vec<FlyingFrame>,
+    mesh_buffer_ring: MeshBufferRing,
 
     events_loop: EventsLoop,
     mesh_recv: Receiver<Mesh<V>>,
@@ -70,10 +71,14 @@ type VkPos = [f64; 2];
 type IndexType = u32;
 
 const MAX_FRAMES_IN_FLIGHT: usize = 4;
+const MESH_BUFFER_RING_SIZE: usize = 4;
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 const MAX_POINT_DIST: f64 = 10.0;
 
 const LOG_LEVEL: log::LevelFilter = log::LevelFilter::Trace;
+
+const VBUF_CAPACITY: DeviceSize = 1_000_000;
+const IBUF_CAPACITY: DeviceSize = 1_000_000;
 
 struct FlyingFrame {
     device: Device,
@@ -87,6 +92,21 @@ struct FlyingFrame {
     image_available_semaphore: vk::Semaphore,
     render_finished_semaphore: vk::Semaphore,
     render_finished_fence: vk::Fence,
+}
+
+struct MeshBufferRing {
+    mesh_buffers: Vec<MeshBuffer>,
+    in_use_fences: Vec<Option<vk::Fence>>,
+    counter: usize,
+}
+
+// does not use a staging buffer
+#[derive(Clone)]
+struct MeshBuffer {
+    vertex: vk::Buffer,
+    vertex_memory: vk::DeviceMemory,
+    index: vk::Buffer,
+    index_memory: vk::DeviceMemory,
 }
 
 impl<V> Renderer<V> {
@@ -144,6 +164,7 @@ impl<V> Renderer<V> {
             })
             .collect();
 
+        let mesh_buffer_ring = MeshBufferRing::new(&device, device_memory_properties, VBUF_CAPACITY, IBUF_CAPACITY, MESH_BUFFER_RING_SIZE);
         // timers
         let timer_mesh_wait = LoopTimer::new("Waiting on mesh gen".to_string());
         let timer_draw = LoopTimer::new("Drawing".to_string());
@@ -179,6 +200,7 @@ impl<V> Renderer<V> {
             queue_family_index,
             device_memory_properties,
             flying_frames,
+            mesh_buffer_ring,
 
             events_loop,
             mesh_recv,
@@ -218,39 +240,29 @@ impl<V> Renderer<V> {
             let mesh = self.mesh_recv.recv().unwrap();
             info!("Got mesh");
 
-            // create buffers
-            info!("Creating buffers...");
-            let (vertex_buffer, vertex_buffer_memory) = create_buffer(
-                &self.device,
-                self.device_memory_properties,
-                size_of_slice(&mesh.vertices),
-                vk::BufferUsageFlags::VERTEX_BUFFER,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            );
-
-            let (index_buffer, index_buffer_memory) = create_buffer(
-                &self.device,
-                self.device_memory_properties,
-                size_of_slice(&mesh.indices),
-                vk::BufferUsageFlags::INDEX_BUFFER,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            );
-
-            // write to buffers
-            write_to_cpu_accessible_buffer(&self.device, vertex_buffer_memory, &mesh.vertices);
-            write_to_cpu_accessible_buffer(&self.device, index_buffer_memory, &mesh.indices);
-
-            info!("Done creating buffers");
-
-            let index_count = mesh.indices.len() as u32;
-
-            let ff_idx = self.frames_drawn % MAX_FRAMES_IN_FLIGHT;
-
             // wait for chosen FlyingFrame's previous rendering operation to
             // complete
+            let ff_idx = self.frames_drawn % MAX_FRAMES_IN_FLIGHT;
+
             info!("Waiting for FF to become available...");
             self.flying_frames[ff_idx].wait();
             info!("Done waiting for FF");
+
+            // write buffers
+            let render_finished_fence = self.flying_frames[ff_idx].render_finished_fence;
+
+            info!("Acquiring buffer...");
+            let buffers = self.mesh_buffer_ring.get(&self.device, render_finished_fence);
+            info!("Done acquiring buffer");
+
+            // write to buffers
+            info!("Writing buffers...");
+            write_to_cpu_accessible_buffer(&self.device, buffers.vertex_memory, &mesh.vertices);
+            write_to_cpu_accessible_buffer(&self.device, buffers.index_memory, &mesh.indices);
+
+            info!("Done writing buffers");
+
+            let index_count = mesh.indices.len() as u32;
 
             let image_available_semaphore =
                 self.flying_frames[ff_idx].get_image_available_semaphore();
@@ -261,8 +273,8 @@ impl<V> Renderer<V> {
             info!("Drawing...");
             self.flying_frames[ff_idx].draw(
                 image_index,
-                vertex_buffer,
-                index_buffer,
+                buffers.vertex,
+                buffers.index,
                 index_count,
                 framebuffer,
                 self.swapchain_dims,
@@ -468,12 +480,6 @@ impl FlyingFrame {
             p_signal_semaphores: signal_semaphores.as_ptr(),
         };
 
-        // somebody else was previously using this fence and we waited until it
-        // was signalled (operation completed). now we need to reset it, because
-        // we aren't yet done but the fence says we are.
-        unsafe { self.device.reset_fences(&[self.render_finished_fence]) }
-            .expect("Couldn't reset render_finished_fence");
-
         let submissions = [submit_info];
         unsafe {
             self.device
@@ -516,6 +522,9 @@ impl FlyingFrame {
                 .wait_for_fences(&[self.render_finished_fence], true, std::u64::MAX)
         }
         .expect("Couldn't wait for previous rendering operation to finish");
+
+        unsafe { self.device.reset_fences(&[self.render_finished_fence]) }
+            .expect("Couldn't reset render_finished_fence");
     }
 
     pub fn get_image_available_semaphore(&self) -> vk::Semaphore {
@@ -950,18 +959,90 @@ fn check_device_swapchain_caps(
     capabilities.current_extent
 }
 
+impl MeshBufferRing {
+    fn new(
+        device: &Device,
+        device_memory_properties: vk::PhysicalDeviceMemoryProperties,
+        vbuf_capacity: vk::DeviceSize,
+        ibuf_capacity: vk::DeviceSize,
+        buffer_count: usize,
+    ) -> Self {
+        Self {
+            mesh_buffers:
+            (0..buffer_count)
+                .map(|_| MeshBuffer::new(
+                    device,
+                    device_memory_properties,
+                    vbuf_capacity,
+                    ibuf_capacity,
+                ))
+                .collect(),
+            counter: 0,
+            in_use_fences: vec![None; buffer_count],
+        }
+    }
+
+    fn get(&mut self, device: &Device, done_fence: vk::Fence) -> MeshBuffer {
+        // done_fence should be signalled once the buffers are no longer in use
+
+        let index = self.counter % self.mesh_buffers.len();
+
+        // wait on the fence of the mesh buffer we're trying to acquire, if it
+        // exists
+        match self.in_use_fences[index] {
+            Some(fence) =>
+                unsafe {
+                    device
+                        .wait_for_fences(&[fence], true, std::u64::MAX)
+                }
+                .expect("Couldn't wait for mesh buffer fence to be signalled"),
+            None => warn!("No done_fence on meshbuf acquire #{}!", self.counter),
+        };
+
+        self.in_use_fences[index] = None;
+
+        self.counter += 1;
+
+        self.mesh_buffers[index].clone()
+    }
+}
+
+impl MeshBuffer {
+    fn new(
+        device: &Device,
+        device_memory_properties: vk::PhysicalDeviceMemoryProperties,
+        vbuf_capacity: vk::DeviceSize,
+        ibuf_capacity: vk::DeviceSize,
+    ) -> Self {
+        let (vertex, vertex_memory) = create_buffer(
+            device,
+            device_memory_properties,
+            vbuf_capacity,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+
+        let (index, index_memory) = create_buffer(
+            device,
+            device_memory_properties,
+            ibuf_capacity,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        );
+
+        Self {
+            vertex,
+            vertex_memory,
+            index,
+            index_memory,
+        }
+    }
+}
+
+
 fn setup_logger() -> Result<(), fern::InitError> {
     fern::Dispatch::new()
         .format(|out, message, record| {
-            /*
-            out.finish(format_args!(
-                "{}[{}][{}] {}",
-                chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S.%f]"),
-                record.target(),
-                record.level(),
-                message
-            ))
-            */
             out.finish(format_args!(
                 "[{}][{}] {}",
                 chrono::Local::now().timestamp_nanos(),
@@ -971,6 +1052,21 @@ fn setup_logger() -> Result<(), fern::InitError> {
         })
         .level(LOG_LEVEL)
         .chain(fern::log_file("single-pipe-renderer.log")?)
-        .apply()?;
+        .chain(
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{}[{}][{}] {}",
+                chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S]"),
+                record.target(),
+                record.level(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Warn)
+        .chain(std::io::stdout())
+    )
+    .apply()?;
+
     Ok(())
 }
