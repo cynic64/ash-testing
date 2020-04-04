@@ -164,7 +164,13 @@ impl<V> Renderer<V> {
             })
             .collect();
 
-        let mesh_buffer_ring = MeshBufferRing::new(&device, device_memory_properties, VBUF_CAPACITY, IBUF_CAPACITY, MESH_BUFFER_RING_SIZE);
+        let mesh_buffer_ring = MeshBufferRing::new(
+            &device,
+            device_memory_properties,
+            VBUF_CAPACITY,
+            IBUF_CAPACITY,
+            MESH_BUFFER_RING_SIZE,
+        );
         // timers
         let timer_mesh_wait = LoopTimer::new("Waiting on mesh gen".to_string());
         let timer_draw = LoopTimer::new("Drawing".to_string());
@@ -252,8 +258,13 @@ impl<V> Renderer<V> {
             let render_finished_fence = self.flying_frames[ff_idx].render_finished_fence;
 
             info!("Acquiring buffer...");
-            let buffers = self.mesh_buffer_ring.get(&self.device, render_finished_fence);
+            let buffers = self
+                .mesh_buffer_ring
+                .get(&self.device, render_finished_fence);
             info!("Done acquiring buffer");
+
+            // a dirty hack :-(
+            self.flying_frames[ff_idx].start_using();
 
             // write to buffers
             info!("Writing buffers...");
@@ -522,6 +533,11 @@ impl FlyingFrame {
                 .wait_for_fences(&[self.render_finished_fence], true, std::u64::MAX)
         }
         .expect("Couldn't wait for previous rendering operation to finish");
+    }
+
+    pub fn start_using(&mut self) {
+        // it can be desirable to set the RFF as unsignalled before rendering
+        // actually begins, so this allows that
 
         unsafe { self.device.reset_fences(&[self.render_finished_fence]) }
             .expect("Couldn't reset render_finished_fence");
@@ -968,14 +984,15 @@ impl MeshBufferRing {
         buffer_count: usize,
     ) -> Self {
         Self {
-            mesh_buffers:
-            (0..buffer_count)
-                .map(|_| MeshBuffer::new(
-                    device,
-                    device_memory_properties,
-                    vbuf_capacity,
-                    ibuf_capacity,
-                ))
+            mesh_buffers: (0..buffer_count)
+                .map(|_| {
+                    MeshBuffer::new(
+                        device,
+                        device_memory_properties,
+                        vbuf_capacity,
+                        ibuf_capacity,
+                    )
+                })
                 .collect(),
             counter: 0,
             in_use_fences: vec![None; buffer_count],
@@ -990,16 +1007,12 @@ impl MeshBufferRing {
         // wait on the fence of the mesh buffer we're trying to acquire, if it
         // exists
         match self.in_use_fences[index] {
-            Some(fence) =>
-                unsafe {
-                    device
-                        .wait_for_fences(&[fence], true, std::u64::MAX)
-                }
+            Some(fence) => unsafe { device.wait_for_fences(&[fence], true, std::u64::MAX) }
                 .expect("Couldn't wait for mesh buffer fence to be signalled"),
             None => warn!("No done_fence on meshbuf acquire #{}!", self.counter),
         };
 
-        self.in_use_fences[index] = None;
+        self.in_use_fences[index] = Some(done_fence);
 
         self.counter += 1;
 
@@ -1039,7 +1052,6 @@ impl MeshBuffer {
     }
 }
 
-
 fn setup_logger() -> Result<(), fern::InitError> {
     fern::Dispatch::new()
         .format(|out, message, record| {
@@ -1050,23 +1062,26 @@ fn setup_logger() -> Result<(), fern::InitError> {
                 message,
             ))
         })
-        .level(LOG_LEVEL)
-        .chain(fern::log_file("single-pipe-renderer.log")?)
         .chain(
-    fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{}[{}][{}] {}",
-                chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S]"),
-                record.target(),
-                record.level(),
-                message
-            ))
-        })
-        .level(log::LevelFilter::Warn)
-        .chain(std::io::stdout())
-    )
-    .apply()?;
+            fern::Dispatch::new()
+                .level(LOG_LEVEL)
+                .chain(fern::log_file("single-pipe-renderer.log")?),
+        )
+        .chain(
+            fern::Dispatch::new()
+                .format(|out, message, record| {
+                    out.finish(format_args!(
+                        "{}[{}][{}] {}",
+                        chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S]"),
+                        record.target(),
+                        record.level(),
+                        message
+                    ))
+                })
+                .level(log::LevelFilter::Warn)
+                .chain(std::io::stdout()),
+        )
+        .apply()?;
 
     Ok(())
 }
