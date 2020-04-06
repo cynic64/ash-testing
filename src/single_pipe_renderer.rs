@@ -81,6 +81,8 @@ const VBUF_CAPACITY: DeviceSize = 1_000_000;
 const IBUF_CAPACITY: DeviceSize = 1_000_000;
 
 struct FlyingFrame {
+    id: String,
+
     device: Device,
     queue: vk::Queue,
     render_pass: vk::RenderPass,
@@ -151,7 +153,7 @@ impl<V> Renderer<V> {
         let command_pool = create_command_pool(&device, queue_family_index);
 
         let flying_frames = (0..MAX_FRAMES_IN_FLIGHT)
-            .map(|_| {
+            .map(|idx| {
                 FlyingFrame::new(
                     device.clone(),
                     queue,
@@ -160,6 +162,7 @@ impl<V> Renderer<V> {
                     swapchain_creator.clone(),
                     swapchain,
                     command_pool,
+                    format!("{}", idx),
                 )
             })
             .collect();
@@ -171,6 +174,7 @@ impl<V> Renderer<V> {
             IBUF_CAPACITY,
             MESH_BUFFER_RING_SIZE,
         );
+
         // timers
         let timer_mesh_wait = LoopTimer::new("Waiting on mesh gen".to_string());
         let timer_draw = LoopTimer::new("Drawing".to_string());
@@ -250,9 +254,9 @@ impl<V> Renderer<V> {
             // complete
             let ff_idx = self.frames_drawn % MAX_FRAMES_IN_FLIGHT;
 
-            info!("Waiting for FF to become available...");
+            info!("Waiting for FF {} to become available...", self.flying_frames[ff_idx].id);
             self.flying_frames[ff_idx].wait();
-            info!("Done waiting for FF");
+            info!("Done waiting for FF {}", self.flying_frames[ff_idx].id);
 
             // write buffers
             let render_finished_fence = self.flying_frames[ff_idx].render_finished_fence;
@@ -290,6 +294,8 @@ impl<V> Renderer<V> {
                 framebuffer,
                 self.swapchain_dims,
             );
+
+            self.frames_drawn += 1;
         }
 
         println!(
@@ -410,7 +416,10 @@ impl FlyingFrame {
         swapchain_creator: Swapchain,
         swapchain: vk::SwapchainKHR,
         command_pool: vk::CommandPool,
+        id: String,
     ) -> Self {
+        // id is used for debug purposes
+
         // create info for semaphores and fences
         let semaphore_info = vk::SemaphoreCreateInfo {
             s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
@@ -434,6 +443,7 @@ impl FlyingFrame {
             unsafe { device.create_fence(&fence_info, None) }.expect("Couldn't create fence");
 
         Self {
+            id,
             device,
             queue,
             render_pass,
