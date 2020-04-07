@@ -160,8 +160,7 @@ impl Renderer {
         let index_count = mesh.indices.len() as u32;
 
         info!("BEGIN 'Acquire Image'");
-        let image_available_semaphore =
-            self.flying_frames[ff_idx].get_image_available_semaphore();
+        let image_available_semaphore = self.flying_frames[ff_idx].get_image_available_semaphore();
 
         let image_index = match self.acquire_image(image_available_semaphore) {
             AcquireResult::Index(image_idx) => image_idx,
@@ -181,7 +180,7 @@ impl Renderer {
             self.swapchain_dims,
         ) {
             // if draw returns true, means we have to recreate swapchain
-            return (events, true)
+            return (events, true);
         };
         info!("END 'Drawing'");
 
@@ -197,7 +196,7 @@ impl Renderer {
 
         self.events_loop.poll_events(|ev| match ev {
             Event::WindowEvent { event, .. } => events.push(event),
-            _ => {},
+            _ => {}
         });
 
         events
@@ -222,7 +221,12 @@ impl Renderer {
         }
     }
 
-    pub fn update_swapchain(&mut self, new_swapchain: vk::SwapchainKHR, new_framebuffers: Vec<vk::Framebuffer>, new_dims: vk::Extent2D) {
+    pub fn update_swapchain(
+        &mut self,
+        new_swapchain: vk::SwapchainKHR,
+        new_framebuffers: Vec<vk::Framebuffer>,
+        new_dims: vk::Extent2D,
+    ) {
         self.swapchain = new_swapchain.clone();
         self.swapchain_dims = new_dims;
         self.framebuffers = new_framebuffers;
@@ -233,18 +237,17 @@ impl Renderer {
     }
 
     pub fn cleanup(self) {
-        unsafe { self.device.device_wait_idle() }.expect("Couldn't wait for device to become idle before cleanup");
+        unsafe { self.device.device_wait_idle() }
+            .expect("Couldn't wait for device to become idle before cleanup");
 
         // all flying frames share the same command pool, so only destroy it
         // once
         let command_pool = self.flying_frames[0].get_command_pool();
 
-        self.flying_frames
-            .into_iter()
-            .for_each(|mut ff| {
-                ff.wait();
-                ff.cleanup();
-            });
+        self.flying_frames.into_iter().for_each(|mut ff| {
+            ff.wait();
+            ff.cleanup();
+        });
 
         unsafe { self.device.destroy_command_pool(command_pool, None) };
     }
@@ -287,7 +290,12 @@ impl FlyingFrame {
             unsafe { device.create_fence(&fence_info, None) }.expect("Couldn't create fence");
 
         // create mesh buffer
-        let mesh_buffer = MeshBuffer::new(&device, device_memory_properties, VBUF_CAPACITY, IBUF_CAPACITY);
+        let mesh_buffer = MeshBuffer::new(
+            &device,
+            device_memory_properties,
+            VBUF_CAPACITY,
+            IBUF_CAPACITY,
+        );
 
         Self {
             id,
@@ -388,9 +396,7 @@ impl FlyingFrame {
                 .queue_present(self.queue, &present_info)
         } {
             Ok(_idk_what_this_is) => false,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                true
-            }
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => true,
             Err(e) => panic!("Unexpected error during queue_present: {}", e),
         }
     }
@@ -404,7 +410,10 @@ impl FlyingFrame {
 
         if let Some(cbuf) = self.prev_used_command_buffer {
             let command_buffers = [cbuf];
-            unsafe { self.device.free_command_buffers(self.command_pool, &command_buffers) };
+            unsafe {
+                self.device
+                    .free_command_buffers(self.command_pool, &command_buffers)
+            };
         } else {
             warn!("No prev cbuf for flying frame {}", self.id);
         }
@@ -431,8 +440,10 @@ impl FlyingFrame {
         self.mesh_buffer.cleanup(&self.device);
 
         unsafe {
-            self.device.destroy_semaphore(self.image_available_semaphore, None);
-            self.device.destroy_semaphore(self.render_finished_semaphore, None);
+            self.device
+                .destroy_semaphore(self.image_available_semaphore, None);
+            self.device
+                .destroy_semaphore(self.render_finished_semaphore, None);
             self.device.destroy_fence(self.render_finished_fence, None);
         }
     }
@@ -519,7 +530,6 @@ fn create_command_pool(device: &Device, queue_family_index: u32) -> vk::CommandP
     unsafe { device.create_command_pool(&command_pool_info, None) }
         .expect("Couldn't create command pool")
 }
-
 
 fn write_to_cpu_accessible_buffer<T>(device: &Device, buffer_memory: vk::DeviceMemory, data: &[T]) {
     let buffer_size = size_of_slice(data);

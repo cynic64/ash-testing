@@ -1,8 +1,8 @@
 use ash::extensions::khr::{Swapchain, XlibSurface};
 use ash::extensions::{ext::DebugUtils, khr::Surface};
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
-use ash::{vk, vk_make_version, Entry};
 use ash::Device;
+use ash::{vk, vk_make_version, Entry};
 
 use winit::dpi::LogicalPosition;
 use winit::{ElementState, MouseButton, WindowEvent};
@@ -327,14 +327,14 @@ pub fn main() {
 
         let mut must_quit = false;
 
-        events
-            .iter()
-            .for_each(|ev| match ev {
-                WindowEvent::CloseRequested => must_quit = true,
-                _ => {},
-            });
+        events.iter().for_each(|ev| match ev {
+            WindowEvent::CloseRequested => must_quit = true,
+            _ => event_send.send(ev.clone()).unwrap(),
+        });
 
-        if must_quit { break }
+        if must_quit {
+            break;
+        }
 
         if must_recreate {
             cleanup_swapchain(
@@ -1102,7 +1102,11 @@ fn cleanup_swapchain(
     framebuffers: Vec<vk::Framebuffer>,
     swapchain_image_views: Vec<vk::ImageView>,
 ) {
-    unsafe { device.device_wait_idle().expect("Couldn't wait on device idle") };
+    unsafe {
+        device
+            .device_wait_idle()
+            .expect("Couldn't wait on device idle")
+    };
 
     // destroy framebuffers
     framebuffers
@@ -1215,4 +1219,3 @@ fn create_framebuffers(
         })
         .collect()
 }
-
