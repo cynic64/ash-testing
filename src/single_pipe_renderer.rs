@@ -18,7 +18,6 @@ pub struct Renderer {
     swapchain_dims: vk::Extent2D,
     framebuffers: Vec<vk::Framebuffer>,
     flying_frames: Vec<FlyingFrame>,
-    mesh_buffer_ring: MeshBufferRing,
 
     events_loop: EventsLoop,
     frames_drawn: usize,
@@ -40,7 +39,6 @@ pub enum AcquireResult {
 type IndexType = u32;
 
 const MAX_FRAMES_IN_FLIGHT: usize = 4;
-const MESH_BUFFER_RING_SIZE: usize = 4;
 
 const LOG_LEVEL: log::LevelFilter = log::LevelFilter::Trace;
 
@@ -58,14 +56,11 @@ struct FlyingFrame {
     swapchain: vk::SwapchainKHR,
     command_pool: vk::CommandPool,
 
+    mesh_buffer: MeshBuffer,
+
     image_available_semaphore: vk::Semaphore,
     render_finished_semaphore: vk::Semaphore,
     render_finished_fence: vk::Fence,
-}
-
-struct MeshBufferRing {
-    mesh_buffers: Vec<MeshBuffer>,
-    counter: usize,
 }
 
 // does not use a staging buffer
@@ -113,18 +108,11 @@ impl Renderer {
                     swapchain_creator.clone(),
                     swapchain,
                     command_pool,
+                    device_memory_properties,
                     format!("{}", idx),
                 )
             })
             .collect();
-
-        let mesh_buffer_ring = MeshBufferRing::new(
-            &device,
-            device_memory_properties,
-            VBUF_CAPACITY,
-            IBUF_CAPACITY,
-            MESH_BUFFER_RING_SIZE,
-        );
 
         Self {
             device: device.clone(),
@@ -133,7 +121,6 @@ impl Renderer {
             swapchain_dims,
             framebuffers,
             flying_frames,
-            mesh_buffer_ring,
 
             events_loop,
             frames_drawn: 0,
@@ -159,14 +146,9 @@ impl Renderer {
         self.flying_frames[ff_idx].wait();
         info!("END 'FF {} Wait'", self.flying_frames[ff_idx].id);
 
-        // write buffers
-        info!("BEGIN 'Get Buffer'");
-        let buffers = self
-            .mesh_buffer_ring
-            .get();
-        info!("END 'Get Buffer'");
-
         // write to buffers
+        let buffers = self.flying_frames[ff_idx].get_mesh_buffer();
+
         info!("BEGIN 'Writing Buffers'");
         write_to_cpu_accessible_buffer(&self.device, buffers.vertex_memory, &mesh.vertices);
         write_to_cpu_accessible_buffer(&self.device, buffers.index_memory, &mesh.indices);
@@ -258,6 +240,7 @@ impl FlyingFrame {
         swapchain_creator: Swapchain,
         swapchain: vk::SwapchainKHR,
         command_pool: vk::CommandPool,
+        device_memory_properties: vk::PhysicalDeviceMemoryProperties,
         id: String,
     ) -> Self {
         // id is used for debug purposes
@@ -284,6 +267,9 @@ impl FlyingFrame {
         let render_finished_fence =
             unsafe { device.create_fence(&fence_info, None) }.expect("Couldn't create fence");
 
+        // create mesh buffer
+        let mesh_buffer = MeshBuffer::new(&device, device_memory_properties, VBUF_CAPACITY, IBUF_CAPACITY);
+
         Self {
             id,
             device,
@@ -293,6 +279,8 @@ impl FlyingFrame {
             swapchain_creator,
             swapchain,
             command_pool,
+
+            mesh_buffer,
 
             image_available_semaphore,
             render_finished_semaphore,
@@ -396,6 +384,12 @@ impl FlyingFrame {
         // returns the semaphore that should be signalled when an image is
         // acquired from the swapchain
         self.image_available_semaphore
+    }
+
+    pub fn get_mesh_buffer(&self) -> MeshBuffer {
+        // There is no safeguard to prevent you from using the MeshBuffer when
+        // you shouldn't, so be careful
+        self.mesh_buffer.clone()
     }
 
     pub fn update_swapchain(&mut self, new_swapchain: vk::SwapchainKHR) {
@@ -602,38 +596,6 @@ fn create_command_buffer(
     unsafe { device.end_command_buffer(command_buffer) }.expect("Couldn't record command buffer!");
 
     command_buffer
-}
-
-impl MeshBufferRing {
-    fn new(
-        device: &Device,
-        device_memory_properties: vk::PhysicalDeviceMemoryProperties,
-        vbuf_capacity: vk::DeviceSize,
-        ibuf_capacity: vk::DeviceSize,
-        buffer_count: usize,
-    ) -> Self {
-        Self {
-            mesh_buffers: (0..buffer_count)
-                .map(|_| {
-                    MeshBuffer::new(
-                        device,
-                        device_memory_properties,
-                        vbuf_capacity,
-                        ibuf_capacity,
-                    )
-                })
-                .collect(),
-            counter: 0,
-        }
-    }
-
-    fn get(&mut self) -> MeshBuffer {
-        let index = self.counter % self.mesh_buffers.len();
-
-        self.counter += 1;
-
-        self.mesh_buffers[index].clone()
-    }
 }
 
 impl MeshBuffer {
