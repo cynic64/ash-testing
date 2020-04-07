@@ -325,6 +325,17 @@ pub fn main() {
         let mesh = mesh_recv.recv().unwrap();
         let (events, must_recreate) = renderer.draw(&mesh);
 
+        let mut must_quit = false;
+
+        events
+            .iter()
+            .for_each(|ev| match ev {
+                WindowEvent::CloseRequested => must_quit = true,
+                _ => {},
+            });
+
+        if must_quit { break }
+
         if must_recreate {
             cleanup_swapchain(
                 device.clone(),
@@ -355,6 +366,7 @@ pub fn main() {
         }
     }
 
+    drop(mesh_recv);
     println!("waiting on mesh thread");
     mesh_gen_handle.join().unwrap();
 
