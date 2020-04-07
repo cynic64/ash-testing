@@ -87,7 +87,7 @@ impl Renderer {
         swapchain_creator: Swapchain,
         swapchain: vk::SwapchainKHR,
         swapchain_dims: vk::Extent2D,
-        swapchain_image_views: Vec<vk::ImageView>,
+        framebuffers: Vec<vk::Framebuffer>,
         render_pass: vk::RenderPass,
         queue_family_index: u32,
         events_loop: EventsLoop,
@@ -95,10 +95,6 @@ impl Renderer {
         setup_logger().expect("Couldn't set up logger");
 
         println!("Maximum frames in flight: {} ", MAX_FRAMES_IN_FLIGHT);
-
-        // framebuffer creation
-        let framebuffers =
-            create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
 
         // command pool
         let command_pool = create_command_pool(&device, queue_family_index);
@@ -192,14 +188,17 @@ impl Renderer {
         info!("END 'Acquire Image'");
 
         info!("BEGIN 'Drawing'");
-        self.flying_frames[ff_idx].draw(
+        if self.flying_frames[ff_idx].draw(
             image_index,
             buffers.vertex,
             buffers.index,
             index_count,
             framebuffer,
             self.swapchain_dims,
-        );
+        ) {
+            // if draw returns true, means we have to recreate swapchain
+            return (events, true)
+        };
         info!("END 'Drawing'");
 
         self.frames_drawn += 1;
@@ -237,6 +236,16 @@ impl Renderer {
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => AcquireResult::OutOfDate,
             Err(e) => panic!("Unexpected error during acquire_next_image: {}", e),
         }
+    }
+
+    pub fn update_swapchain(&mut self, new_swapchain: vk::SwapchainKHR, new_framebuffers: Vec<vk::Framebuffer>, new_dims: vk::Extent2D) {
+        self.swapchain = new_swapchain.clone();
+        self.swapchain_dims = new_dims;
+        self.framebuffers = new_framebuffers;
+
+        self.flying_frames
+            .iter_mut()
+            .for_each(|ff| ff.update_swapchain(new_swapchain.clone()));
     }
 }
 
@@ -299,7 +308,9 @@ impl FlyingFrame {
         index_count: u32,
         framebuffer: vk::Framebuffer,
         dimensions: vk::Extent2D,
-    ) {
+    ) -> bool {
+        // returns whether the swapchain was out of date or not
+
         unsafe { self.device.reset_fences(&[self.render_finished_fence]) }
             .expect("Couldn't reset render_finished_fence");
 
@@ -365,12 +376,12 @@ impl FlyingFrame {
             self.swapchain_creator
                 .queue_present(self.queue, &present_info)
         } {
-            Ok(_idk_what_this_is) => (),
+            Ok(_idk_what_this_is) => false,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                panic!("Swapchain out of date!");
+                true
             }
             Err(e) => panic!("Unexpected error during queue_present: {}", e),
-        };
+        }
     }
 
     pub fn wait(&mut self) {
@@ -382,38 +393,15 @@ impl FlyingFrame {
     }
 
     pub fn get_image_available_semaphore(&self) -> vk::Semaphore {
-        // returns the semaphore that should be signalled whenn an image is
+        // returns the semaphore that should be signalled when an image is
         // acquired from the swapchain
         self.image_available_semaphore
     }
-}
 
-fn create_framebuffers(
-    device: &Device,
-    render_pass: vk::RenderPass,
-    dimensions: vk::Extent2D,
-    image_views: &[vk::ImageView],
-) -> Vec<vk::Framebuffer> {
-    image_views
-        .iter()
-        .map(|iv| {
-            let image_views = [*iv];
-            let framebuffer_info = vk::FramebufferCreateInfo {
-                s_type: vk::StructureType::FRAMEBUFFER_CREATE_INFO,
-                p_next: ptr::null(),
-                flags: vk::FramebufferCreateFlags::empty(),
-                render_pass,
-                attachment_count: 1,
-                p_attachments: image_views.as_ptr(),
-                width: dimensions.width,
-                height: dimensions.height,
-                layers: 1,
-            };
-
-            unsafe { device.create_framebuffer(&framebuffer_info, None) }
-                .expect("Couldn't create framebuffer")
-        })
-        .collect()
+    pub fn update_swapchain(&mut self, new_swapchain: vk::SwapchainKHR) {
+        // should be called whenever the swapchain is recreated
+        self.swapchain = new_swapchain;
+    }
 }
 
 fn create_buffer(

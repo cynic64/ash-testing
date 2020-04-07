@@ -1,11 +1,11 @@
 use ash::extensions::khr::{Swapchain, XlibSurface};
 use ash::extensions::{ext::DebugUtils, khr::Surface};
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
-use ash::vk::DeviceSize;
 use ash::{vk, vk_make_version, Entry};
+use ash::Device;
 
 use winit::dpi::LogicalPosition;
-use winit::{ElementState, Event, MouseButton, WindowEvent};
+use winit::{ElementState, MouseButton, WindowEvent};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
@@ -22,7 +22,7 @@ use std::ptr;
 use memoffset::offset_of;
 
 use ash_testing::single_pipe_renderer::{Mesh, Renderer};
-use ash_testing::{get_elapsed, relative_path, size_of_slice, LoopTimer};
+use ash_testing::{relative_path, LoopTimer};
 
 #[cfg(target_os = "macos")]
 extern crate cocoa;
@@ -73,7 +73,7 @@ struct Vertex {
 
 pub fn main() {
     // create winit window
-    let mut events_loop = winit::EventsLoop::new();
+    let events_loop = winit::EventsLoop::new();
     let window = winit::WindowBuilder::new()
         .with_title("Ash - Example")
         .build(&events_loop)
@@ -270,14 +270,12 @@ pub fn main() {
 
     let shader_stages = [vert_stage_info, frag_stage_info];
 
-    // mesh allocation sizes
-    let est_vertices = 100_000;
-    let est_indices = 200_000;
-    let vertex_buffer_capacity = (est_vertices * std::mem::size_of::<Vertex>()) as DeviceSize;
-    let index_buffer_capacity = (est_indices * std::mem::size_of::<IndexType>()) as DeviceSize;
-
     // render pass
     let render_pass = create_render_pass(&device);
+
+    // framebuffer creation
+    let mut framebuffers =
+        create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
 
     // pipeline layout
     let pipeline_layout = create_pipeline_layout(&device);
@@ -286,11 +284,10 @@ pub fn main() {
     let binding_descriptions = Vertex::get_binding_descriptions();
     let attribute_descriptions = Vertex::get_attribute_descriptions();
 
-    let mut pipeline = create_pipeline(
+    let pipeline = create_pipeline(
         &device,
         render_pass,
         pipeline_layout,
-        swapchain_dims,
         shader_stages,
         &binding_descriptions,
         &attribute_descriptions,
@@ -315,28 +312,48 @@ pub fn main() {
         physical_device,
         queue,
         pipeline,
-        pipeline_layout,
-        swapchain_creator,
-        swapchain,
-        swapchain_dims,
-        swapchain_images,
-        swapchain_image_views,
-        surface_loader.clone(),
-        surface,
+        swapchain_creator.clone(),
+        swapchain.clone(),
+        swapchain_dims.clone(),
+        framebuffers.clone(),
         render_pass,
-        shader_stages,
-        binding_descriptions,
-        attribute_descriptions,
-        vertex_buffer_capacity,
-        index_buffer_capacity,
         queue_family_index,
         events_loop,
-        mesh_recv,
-        event_send,
     );
 
-    renderer.start();
-    // renderer.cleanup();
+    loop {
+        let mesh = mesh_recv.recv().unwrap();
+        let (events, must_recreate) = renderer.draw(&mesh);
+
+        if must_recreate {
+            cleanup_swapchain(
+                device.clone(),
+                swapchain_creator.clone(),
+                swapchain,
+                framebuffers.clone(),
+                swapchain_image_views.clone(),
+            );
+
+            let ret = create_swapchain(
+                physical_device,
+                &surface_loader,
+                surface,
+                &swapchain_creator,
+            );
+
+            swapchain = ret.0;
+            swapchain_images = ret.1;
+            swapchain_dims = ret.2;
+
+            swapchain_image_views = create_swapchain_image_views(&device, &swapchain_images);
+
+            // framebuffer creation
+            framebuffers =
+                create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
+
+            renderer.update_swapchain(swapchain.clone(), framebuffers.clone(), swapchain_dims);
+        }
+    }
 
     println!("waiting on mesh thread");
     mesh_gen_handle.join().unwrap();
@@ -372,7 +389,6 @@ fn mesh_thread(
         vec![]
     };
 
-    let mut mouse_pos = [-9999.0, -9999.0];
     let mut mouse_down = false;
     let mut last_used_mouse_pos = [-9999.0, -9999.0];
 
@@ -406,8 +422,6 @@ fn mesh_thread(
             _ => {}
         });
 
-        if mouse_down {}
-
         let mesh = create_mesh(&points);
 
         /*
@@ -421,7 +435,7 @@ fn mesh_thread(
 
         timer.stop();
 
-        match mesh_send.try_send(mesh) {
+        match mesh_send.try_send(mesh.clone()) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => {
@@ -533,7 +547,7 @@ fn create_debug_points() -> Vec<VkPos> {
     let mut rng = ChaCha20Rng::seed_from_u64(0);
     // with tolerance 0.0001, 4 points gives 792 indices and 300 points gives
     // 89,952
-    (0..300)
+    (0..4)
         .map(|_| {
             let x = rng.gen::<f64>() * 2.0 - 1.0;
             let y = rng.gen::<f64>() * 2.0 - 1.0;
@@ -573,7 +587,6 @@ fn create_pipeline<D: DeviceV1_0>(
     device: &D,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
-    swapchain_dims: vk::Extent2D,
     shader_stages: [vk::PipelineShaderStageCreateInfo; 2],
     binding_descriptions: &[vk::VertexInputBindingDescription],
     attribute_descriptions: &[vk::VertexInputAttributeDescription],
@@ -1058,6 +1071,29 @@ fn create_swapchain(
     (swapchain, images, dimensions)
 }
 
+fn cleanup_swapchain(
+    device: Device,
+    swapchain_creator: Swapchain,
+    swapchain: vk::SwapchainKHR,
+    framebuffers: Vec<vk::Framebuffer>,
+    swapchain_image_views: Vec<vk::ImageView>,
+) {
+    unsafe { device.device_wait_idle().expect("Couldn't wait on device idle") };
+
+    // destroy framebuffers
+    framebuffers
+        .iter()
+        .for_each(|&fb| unsafe { device.destroy_framebuffer(fb, None) });
+
+    // destroy swapchain image views
+    swapchain_image_views
+        .iter()
+        .for_each(|&view| unsafe { device.destroy_image_view(view, None) });
+
+    // destroy swapchain
+    unsafe { swapchain_creator.destroy_swapchain(swapchain, None) };
+}
+
 fn create_swapchain_image_views<D: DeviceV1_0>(
     device: &D,
     images: &[vk::Image],
@@ -1127,3 +1163,32 @@ fn check_device_swapchain_caps(
 
     capabilities.current_extent
 }
+
+fn create_framebuffers(
+    device: &Device,
+    render_pass: vk::RenderPass,
+    dimensions: vk::Extent2D,
+    image_views: &[vk::ImageView],
+) -> Vec<vk::Framebuffer> {
+    image_views
+        .iter()
+        .map(|iv| {
+            let image_views = [*iv];
+            let framebuffer_info = vk::FramebufferCreateInfo {
+                s_type: vk::StructureType::FRAMEBUFFER_CREATE_INFO,
+                p_next: ptr::null(),
+                flags: vk::FramebufferCreateFlags::empty(),
+                render_pass,
+                attachment_count: 1,
+                p_attachments: image_views.as_ptr(),
+                width: dimensions.width,
+                height: dimensions.height,
+                layers: 1,
+            };
+
+            unsafe { device.create_framebuffer(&framebuffer_info, None) }
+                .expect("Couldn't create framebuffer")
+        })
+        .collect()
+}
+
