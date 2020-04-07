@@ -3,7 +3,7 @@ use ash::version::{DeviceV1_0, InstanceV1_0};
 use ash::vk::DeviceSize;
 use ash::{vk, Device, Instance};
 
-use log::info;
+use log::{info, warn};
 
 use winit::{Event, EventsLoop, WindowEvent};
 
@@ -61,6 +61,8 @@ struct FlyingFrame {
     image_available_semaphore: vk::Semaphore,
     render_finished_semaphore: vk::Semaphore,
     render_finished_fence: vk::Fence,
+
+    prev_used_command_buffer: Option<vk::CommandBuffer>,
 }
 
 // does not use a staging buffer
@@ -229,10 +231,27 @@ impl Renderer {
             .iter_mut()
             .for_each(|ff| ff.update_swapchain(new_swapchain.clone()));
     }
+
+    pub fn cleanup(self) {
+        unsafe { self.device.device_wait_idle() }.expect("Couldn't wait for device to become idle before cleanup");
+
+        // all flying frames share the same command pool, so only destroy it
+        // once
+        let command_pool = self.flying_frames[0].get_command_pool();
+
+        self.flying_frames
+            .into_iter()
+            .for_each(|mut ff| {
+                ff.wait();
+                ff.cleanup();
+            });
+
+        unsafe { self.device.destroy_command_pool(command_pool, None) };
+    }
 }
 
 impl FlyingFrame {
-    pub fn new(
+    fn new(
         device: Device,
         queue: vk::Queue,
         render_pass: vk::RenderPass,
@@ -285,10 +304,12 @@ impl FlyingFrame {
             image_available_semaphore,
             render_finished_semaphore,
             render_finished_fence,
+
+            prev_used_command_buffer: None,
         }
     }
 
-    pub fn draw(
+    fn draw(
         &mut self,
         image_index: u32,
         vertex_buffer: vk::Buffer,
@@ -343,6 +364,8 @@ impl FlyingFrame {
         }
         .expect("Couldn't submit command buffer");
 
+        self.prev_used_command_buffer = Some(command_buffer);
+
         // present
         let swapchains = [self.swapchain];
         let image_indices = [image_index];
@@ -372,29 +395,50 @@ impl FlyingFrame {
         }
     }
 
-    pub fn wait(&mut self) {
+    fn wait(&mut self) {
         unsafe {
             self.device
                 .wait_for_fences(&[self.render_finished_fence], true, std::u64::MAX)
         }
         .expect("Couldn't wait for previous rendering operation to finish");
+
+        if let Some(cbuf) = self.prev_used_command_buffer {
+            let command_buffers = [cbuf];
+            unsafe { self.device.free_command_buffers(self.command_pool, &command_buffers) };
+        } else {
+            warn!("No prev cbuf for flying frame {}", self.id);
+        }
     }
 
-    pub fn get_image_available_semaphore(&self) -> vk::Semaphore {
+    fn get_image_available_semaphore(&self) -> vk::Semaphore {
         // returns the semaphore that should be signalled when an image is
         // acquired from the swapchain
         self.image_available_semaphore
     }
 
-    pub fn get_mesh_buffer(&self) -> MeshBuffer {
+    fn get_mesh_buffer(&self) -> MeshBuffer {
         // There is no safeguard to prevent you from using the MeshBuffer when
         // you shouldn't, so be careful
         self.mesh_buffer.clone()
     }
 
-    pub fn update_swapchain(&mut self, new_swapchain: vk::SwapchainKHR) {
+    fn update_swapchain(&mut self, new_swapchain: vk::SwapchainKHR) {
         // should be called whenever the swapchain is recreated
         self.swapchain = new_swapchain;
+    }
+
+    fn cleanup(self) {
+        self.mesh_buffer.cleanup(&self.device);
+
+        unsafe {
+            self.device.destroy_semaphore(self.image_available_semaphore, None);
+            self.device.destroy_semaphore(self.render_finished_semaphore, None);
+            self.device.destroy_fence(self.render_finished_fence, None);
+        }
+    }
+
+    fn get_command_pool(&self) -> vk::CommandPool {
+        self.command_pool
     }
 }
 
@@ -626,6 +670,15 @@ impl MeshBuffer {
             vertex_memory,
             index,
             index_memory,
+        }
+    }
+
+    fn cleanup(self, device: &Device) {
+        unsafe {
+            device.free_memory(self.vertex_memory, None);
+            device.free_memory(self.index_memory, None);
+            device.destroy_buffer(self.vertex, None);
+            device.destroy_buffer(self.index, None);
         }
     }
 }

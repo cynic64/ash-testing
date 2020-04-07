@@ -366,11 +366,23 @@ pub fn main() {
         }
     }
 
+    renderer.cleanup();
+
     drop(mesh_recv);
     println!("waiting on mesh thread");
     mesh_gen_handle.join().unwrap();
 
+    cleanup_swapchain(
+        device.clone(),
+        swapchain_creator.clone(),
+        swapchain,
+        framebuffers.clone(),
+        swapchain_image_views.clone(),
+    );
+
     unsafe {
+        device.destroy_pipeline(pipeline, None);
+
         device.destroy_pipeline_layout(pipeline_layout, None);
         device.destroy_render_pass(render_pass, None);
 
