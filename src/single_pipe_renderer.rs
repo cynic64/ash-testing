@@ -1,4 +1,3 @@
-use ash::extensions::khr::Swapchain;
 use ash::version::{DeviceV1_0, InstanceV1_0};
 use ash::vk::DeviceSize;
 use ash::{vk, Device, Instance};
@@ -13,10 +12,6 @@ use std::ptr;
 
 pub struct Renderer {
     device: Device,
-    swapchain_creator: Swapchain,
-    swapchain: vk::SwapchainKHR,
-    swapchain_dims: vk::Extent2D,
-    framebuffers: Vec<vk::Framebuffer>,
     flying_frames: Vec<FlyingFrame>,
 
     events_loop: EventsLoop,
@@ -27,11 +22,6 @@ pub struct Renderer {
 pub struct Mesh<V> {
     pub vertices: Vec<V>,
     pub indices: Vec<IndexType>,
-}
-
-pub enum AcquireResult {
-    Index(u32),
-    OutOfDate,
 }
 
 // range from 0.0 .. screen size
@@ -52,8 +42,6 @@ struct FlyingFrame {
     queue: vk::Queue,
     render_pass: vk::RenderPass,
     pipeline: vk::Pipeline,
-    swapchain_creator: Swapchain,
-    swapchain: vk::SwapchainKHR,
     command_pool: vk::CommandPool,
 
     mesh_buffer: MeshBuffer,
@@ -81,10 +69,6 @@ impl Renderer {
         physical_device: vk::PhysicalDevice,
         queue: vk::Queue,
         pipeline: vk::Pipeline,
-        swapchain_creator: Swapchain,
-        swapchain: vk::SwapchainKHR,
-        swapchain_dims: vk::Extent2D,
-        framebuffers: Vec<vk::Framebuffer>,
         render_pass: vk::RenderPass,
         queue_family_index: u32,
         events_loop: EventsLoop,
@@ -107,8 +91,6 @@ impl Renderer {
                     queue,
                     render_pass,
                     pipeline,
-                    swapchain_creator.clone(),
-                    swapchain,
                     command_pool,
                     device_memory_properties,
                     format!("{}", idx),
@@ -118,10 +100,6 @@ impl Renderer {
 
         Self {
             device: device.clone(),
-            swapchain_creator,
-            swapchain,
-            swapchain_dims,
-            framebuffers,
             flying_frames,
 
             events_loop,
@@ -129,9 +107,13 @@ impl Renderer {
         }
     }
 
-    pub fn draw<V>(&mut self, mesh: &Mesh<V>) -> (Vec<WindowEvent>, bool) {
-        // returns a list of all events collected in the frame and whether the
-        // swapchain needs to be recreated or not
+    pub fn get_image_available_semaphore(&self) -> vk::Semaphore {
+        self.flying_frames[self.frames_drawn % MAX_FRAMES_IN_FLIGHT].get_image_available_semaphore()
+    }
+
+    pub fn draw<V>(&mut self, mesh: &Mesh<V>, framebuffer: vk::Framebuffer, swapchain_dims: vk::Extent2D) -> (Vec<WindowEvent>, vk::Semaphore) {
+        // returns a list of all events collected in the frame and a semaphore
+        // signalled when rendering is finished
 
         // assumes the mesh is different every frame, so will always copy its
         // data to the GPU
@@ -159,34 +141,19 @@ impl Renderer {
 
         let index_count = mesh.indices.len() as u32;
 
-        info!("BEGIN 'Acquire Image'");
-        let image_available_semaphore = self.flying_frames[ff_idx].get_image_available_semaphore();
-
-        let image_index = match self.acquire_image(image_available_semaphore) {
-            AcquireResult::Index(image_idx) => image_idx,
-            AcquireResult::OutOfDate => return (events, true),
-        };
-
-        let framebuffer = self.framebuffers[image_index as usize];
-        info!("END 'Acquire Image'");
-
-        info!("BEGIN 'Drawing'");
-        if self.flying_frames[ff_idx].draw(
-            image_index,
+        info!("BEGIN 'Creation/Submission'");
+        let render_finished_semaphore = self.flying_frames[ff_idx].create_and_submit(
             buffers.vertex,
             buffers.index,
             index_count,
             framebuffer,
-            self.swapchain_dims,
-        ) {
-            // if draw returns true, means we have to recreate swapchain
-            return (events, true);
-        };
-        info!("END 'Drawing'");
+            swapchain_dims,
+        );
+        info!("END 'Creation/Submission'");
 
         self.frames_drawn += 1;
 
-        (events, false)
+        (events, render_finished_semaphore)
     }
 
     fn collect_events(&mut self) -> Vec<WindowEvent> {
@@ -200,40 +167,6 @@ impl Renderer {
         });
 
         events
-    }
-
-    fn acquire_image(&mut self, semaphore: vk::Semaphore) -> AcquireResult {
-        // takes a semaphore to signal when image is acquired
-
-        let acquire_result = unsafe {
-            self.swapchain_creator.acquire_next_image(
-                self.swapchain,
-                std::u64::MAX,
-                semaphore,
-                vk::Fence::null(),
-            )
-        };
-
-        match acquire_result {
-            Ok((image_idx, _is_sub_optimal)) => AcquireResult::Index(image_idx),
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => AcquireResult::OutOfDate,
-            Err(e) => panic!("Unexpected error during acquire_next_image: {}", e),
-        }
-    }
-
-    pub fn update_swapchain(
-        &mut self,
-        new_swapchain: vk::SwapchainKHR,
-        new_framebuffers: Vec<vk::Framebuffer>,
-        new_dims: vk::Extent2D,
-    ) {
-        self.swapchain = new_swapchain.clone();
-        self.swapchain_dims = new_dims;
-        self.framebuffers = new_framebuffers;
-
-        self.flying_frames
-            .iter_mut()
-            .for_each(|ff| ff.update_swapchain(new_swapchain.clone()));
     }
 
     pub fn cleanup(self) {
@@ -259,8 +192,6 @@ impl FlyingFrame {
         queue: vk::Queue,
         render_pass: vk::RenderPass,
         pipeline: vk::Pipeline,
-        swapchain_creator: Swapchain,
-        swapchain: vk::SwapchainKHR,
         command_pool: vk::CommandPool,
         device_memory_properties: vk::PhysicalDeviceMemoryProperties,
         id: String,
@@ -303,8 +234,6 @@ impl FlyingFrame {
             queue,
             render_pass,
             pipeline,
-            swapchain_creator,
-            swapchain,
             command_pool,
 
             mesh_buffer,
@@ -317,16 +246,15 @@ impl FlyingFrame {
         }
     }
 
-    fn draw(
+    fn create_and_submit(
         &mut self,
-        image_index: u32,
         vertex_buffer: vk::Buffer,
         index_buffer: vk::Buffer,
         index_count: u32,
         framebuffer: vk::Framebuffer,
         dimensions: vk::Extent2D,
-    ) -> bool {
-        // returns whether the swapchain was out of date or not
+    ) -> vk::Semaphore {
+        // returns a semaphore signalled when rendering completes
 
         unsafe { self.device.reset_fences(&[self.render_finished_fence]) }
             .expect("Couldn't reset render_finished_fence");
@@ -374,31 +302,7 @@ impl FlyingFrame {
 
         self.prev_used_command_buffer = Some(command_buffer);
 
-        // present
-        let swapchains = [self.swapchain];
-        let image_indices = [image_index];
-
-        let signal_semaphores = [self.render_finished_semaphore];
-
-        let present_info = vk::PresentInfoKHR {
-            s_type: vk::StructureType::PRESENT_INFO_KHR,
-            p_next: ptr::null(),
-            wait_semaphore_count: 1,
-            p_wait_semaphores: signal_semaphores.as_ptr(),
-            swapchain_count: 1,
-            p_swapchains: swapchains.as_ptr(),
-            p_image_indices: image_indices.as_ptr(),
-            p_results: ptr::null_mut(),
-        };
-
-        match unsafe {
-            self.swapchain_creator
-                .queue_present(self.queue, &present_info)
-        } {
-            Ok(_idk_what_this_is) => false,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => true,
-            Err(e) => panic!("Unexpected error during queue_present: {}", e),
-        }
+        self.render_finished_semaphore
     }
 
     fn wait(&mut self) {
@@ -429,11 +333,6 @@ impl FlyingFrame {
         // There is no safeguard to prevent you from using the MeshBuffer when
         // you shouldn't, so be careful
         self.mesh_buffer.clone()
-    }
-
-    fn update_swapchain(&mut self, new_swapchain: vk::SwapchainKHR) {
-        // should be called whenever the swapchain is recreated
-        self.swapchain = new_swapchain;
     }
 
     fn cleanup(self) {

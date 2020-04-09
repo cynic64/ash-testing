@@ -1,7 +1,6 @@
-use ash::extensions::khr::{Swapchain, XlibSurface};
+use ash::extensions::khr::XlibSurface;
 use ash::extensions::{ext::DebugUtils, khr::Surface};
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
-use ash::Device;
 use ash::{vk, vk_make_version, Entry};
 
 use winit::dpi::LogicalPosition;
@@ -22,6 +21,7 @@ use std::ptr;
 use memoffset::offset_of;
 
 use ash_testing::single_pipe_renderer::{Mesh, Renderer};
+use ash_testing::window::Vindow;
 use ash_testing::{relative_path, LoopTimer};
 
 #[cfg(target_os = "macos")]
@@ -226,19 +226,6 @@ pub fn main() {
     // get queue (0 = take first queue)
     let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
-    let swapchain_creator = Swapchain::new(&instance, &device);
-
-    let (mut swapchain, mut swapchain_images, mut swapchain_dims) = create_swapchain(
-        physical_device,
-        &surface_loader,
-        surface,
-        &swapchain_creator,
-    );
-
-    println!("Swapchain image count: {}", swapchain_images.len());
-
-    let mut swapchain_image_views = create_swapchain_image_views(&device, &swapchain_images);
-
     // shaders
     let frag_code = read_shader_code(&relative_path("shaders/vt-5-vbuf/triangle.frag.spv"));
     let vert_code = read_shader_code(&relative_path("shaders/vt-5-vbuf/triangle.vert.spv"));
@@ -273,9 +260,15 @@ pub fn main() {
     // render pass
     let render_pass = create_render_pass(&device);
 
-    // framebuffer creation
-    let mut framebuffers =
-        create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
+    let mut vindow = Vindow::new(
+        physical_device,
+        device.clone(),
+        instance.clone(),
+        queue,
+        render_pass,
+        surface_loader.clone(),
+        surface,
+    );
 
     // pipeline layout
     let pipeline_layout = create_pipeline_layout(&device);
@@ -303,7 +296,11 @@ pub fn main() {
 
     // spawn it
     let mesh_gen_handle = std::thread::spawn(move || {
-        mesh_thread(mesh_send, event_recv, hidpi_factor, swapchain_dims)
+        // dummy extent value for now
+        mesh_thread(mesh_send, event_recv, hidpi_factor, vk::Extent2D {
+            width: 1000,
+            height: 1000,
+        })
     });
 
     let mut renderer = Renderer::new(
@@ -312,19 +309,24 @@ pub fn main() {
         physical_device,
         queue,
         pipeline,
-        swapchain_creator.clone(),
-        swapchain.clone(),
-        swapchain_dims.clone(),
-        framebuffers.clone(),
         render_pass,
         queue_family_index,
         events_loop,
     );
 
     loop {
-        let mesh = mesh_recv.recv().unwrap();
-        let (events, must_recreate) = renderer.draw(&mesh);
+        // acquire an image
+        let image_available_semaphore = renderer.get_image_available_semaphore();
+        let (framebuffer, dims) = vindow.acquire(image_available_semaphore);
 
+        // create and submit command buffer
+        let mesh = mesh_recv.recv().unwrap();
+        let (events, render_finished_semaphore) = renderer.draw(&mesh, framebuffer, dims);
+
+        // present result
+        vindow.present(render_finished_semaphore);
+
+        // process events
         let mut must_quit = false;
 
         events.iter().for_each(|ev| match ev {
@@ -335,35 +337,6 @@ pub fn main() {
         if must_quit {
             break;
         }
-
-        if must_recreate {
-            cleanup_swapchain(
-                device.clone(),
-                swapchain_creator.clone(),
-                swapchain,
-                framebuffers.clone(),
-                swapchain_image_views.clone(),
-            );
-
-            let ret = create_swapchain(
-                physical_device,
-                &surface_loader,
-                surface,
-                &swapchain_creator,
-            );
-
-            swapchain = ret.0;
-            swapchain_images = ret.1;
-            swapchain_dims = ret.2;
-
-            swapchain_image_views = create_swapchain_image_views(&device, &swapchain_images);
-
-            // framebuffer creation
-            framebuffers =
-                create_framebuffers(&device, render_pass, swapchain_dims, &swapchain_image_views);
-
-            renderer.update_swapchain(swapchain.clone(), framebuffers.clone(), swapchain_dims);
-        }
     }
 
     renderer.cleanup();
@@ -371,14 +344,6 @@ pub fn main() {
     drop(mesh_recv);
     println!("waiting on mesh thread");
     mesh_gen_handle.join().unwrap();
-
-    cleanup_swapchain(
-        device.clone(),
-        swapchain_creator.clone(),
-        swapchain,
-        framebuffers.clone(),
-        swapchain_image_views.clone(),
-    );
 
     unsafe {
         device.destroy_pipeline(pipeline, None);
@@ -1049,173 +1014,4 @@ fn vk_to_point(vk_pos: &VkPos) -> lyon::math::Point {
 
 fn pixel_dist(a: &PixelPos, b: &PixelPos) -> f64 {
     ((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1])).sqrt()
-}
-
-fn create_swapchain(
-    physical_device: vk::PhysicalDevice,
-    surface_loader: &Surface,
-    surface: vk::SurfaceKHR,
-    swapchain_creator: &Swapchain,
-) -> (vk::SwapchainKHR, Vec<vk::Image>, vk::Extent2D) {
-    // check device swapchain capabilties (not just that it has the extension,
-    // also formats and stuff like that)
-    // also returns what dimensions the swapchain should initially be created at
-    let dimensions = check_device_swapchain_caps(surface_loader, physical_device, surface);
-
-    // for now, the format is fixed - might be good to change later.
-
-    // create swapchain
-    let create_info = vk::SwapchainCreateInfoKHR {
-        s_type: vk::StructureType::SWAPCHAIN_CREATE_INFO_KHR,
-        p_next: ptr::null(),
-        flags: vk::SwapchainCreateFlagsKHR::empty(),
-        surface: surface,
-        min_image_count: 2,
-        image_format: SWAPCHAIN_FORMAT,
-        image_color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
-        image_extent: dimensions,
-        image_array_layers: 1,
-        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
-        image_sharing_mode: vk::SharingMode::EXCLUSIVE,
-        queue_family_index_count: 0,
-        p_queue_family_indices: ptr::null(),
-        pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
-        composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
-        present_mode: vk::PresentModeKHR::IMMEDIATE,
-        clipped: vk::TRUE,
-        old_swapchain: vk::SwapchainKHR::null(),
-    };
-
-    let swapchain = unsafe { swapchain_creator.create_swapchain(&create_info, None) }
-        .expect("Couldn't create swapchain");
-
-    let images = unsafe { swapchain_creator.get_swapchain_images(swapchain) }
-        .expect("Couldn't get swapchain images");
-
-    (swapchain, images, dimensions)
-}
-
-fn cleanup_swapchain(
-    device: Device,
-    swapchain_creator: Swapchain,
-    swapchain: vk::SwapchainKHR,
-    framebuffers: Vec<vk::Framebuffer>,
-    swapchain_image_views: Vec<vk::ImageView>,
-) {
-    unsafe {
-        device
-            .device_wait_idle()
-            .expect("Couldn't wait on device idle")
-    };
-
-    // destroy framebuffers
-    framebuffers
-        .iter()
-        .for_each(|&fb| unsafe { device.destroy_framebuffer(fb, None) });
-
-    // destroy swapchain image views
-    swapchain_image_views
-        .iter()
-        .for_each(|&view| unsafe { device.destroy_image_view(view, None) });
-
-    // destroy swapchain
-    unsafe { swapchain_creator.destroy_swapchain(swapchain, None) };
-}
-
-fn create_swapchain_image_views<D: DeviceV1_0>(
-    device: &D,
-    images: &[vk::Image],
-) -> Vec<vk::ImageView> {
-    images
-        .iter()
-        .map(|image| {
-            let iv_info = vk::ImageViewCreateInfo {
-                s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
-                p_next: ptr::null(),
-                flags: vk::ImageViewCreateFlags::empty(),
-                image: *image,
-                view_type: vk::ImageViewType::TYPE_2D,
-                format: SWAPCHAIN_FORMAT,
-                components: vk::ComponentMapping {
-                    r: vk::ComponentSwizzle::IDENTITY,
-                    g: vk::ComponentSwizzle::IDENTITY,
-                    b: vk::ComponentSwizzle::IDENTITY,
-                    a: vk::ComponentSwizzle::IDENTITY,
-                },
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-            };
-
-            unsafe { device.create_image_view(&iv_info, None) }
-                .expect("Couldn't create image view info")
-        })
-        .collect()
-}
-
-fn check_device_swapchain_caps(
-    surface_loader: &Surface,
-    physical_device: vk::PhysicalDevice,
-    surface: vk::SurfaceKHR,
-) -> vk::Extent2D {
-    // returns the current dimensions of the swapchain
-
-    let capabilities = unsafe {
-        surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
-    }
-    .expect("Couldn't get physical device surface capabilities");
-
-    let formats =
-        unsafe { surface_loader.get_physical_device_surface_formats(physical_device, surface) }
-            .expect("Couldn't get physical device surface formats");
-
-    let present_modes = unsafe {
-        surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
-    }
-    .expect("Couldn't get physical device surface present modes");
-
-    // we will request 3 swapchain images to avoid having to wait while one is
-    // being cleared or something, idk exactly
-    assert!(capabilities.min_image_count <= 3 && capabilities.max_image_count >= 3);
-
-    formats
-        .iter()
-        .find(|fmt| fmt.format == vk::Format::B8G8R8A8_UNORM)
-        .expect("Swapchain doesn't support B8G8R8A8_UNORM!");
-
-    assert!(present_modes.contains(&vk::PresentModeKHR::IMMEDIATE));
-
-    capabilities.current_extent
-}
-
-fn create_framebuffers(
-    device: &Device,
-    render_pass: vk::RenderPass,
-    dimensions: vk::Extent2D,
-    image_views: &[vk::ImageView],
-) -> Vec<vk::Framebuffer> {
-    image_views
-        .iter()
-        .map(|iv| {
-            let image_views = [*iv];
-            let framebuffer_info = vk::FramebufferCreateInfo {
-                s_type: vk::StructureType::FRAMEBUFFER_CREATE_INFO,
-                p_next: ptr::null(),
-                flags: vk::FramebufferCreateFlags::empty(),
-                render_pass,
-                attachment_count: 1,
-                p_attachments: image_views.as_ptr(),
-                width: dimensions.width,
-                height: dimensions.height,
-                layers: 1,
-            };
-
-            unsafe { device.create_framebuffer(&framebuffer_info, None) }
-                .expect("Couldn't create framebuffer")
-        })
-        .collect()
 }

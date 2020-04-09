@@ -1,4 +1,5 @@
 pub mod single_pipe_renderer;
+pub mod window;
 
 use std::path::PathBuf;
 
