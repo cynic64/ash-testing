@@ -20,12 +20,21 @@ pub struct Vindow {
 
     // created
     swapchain_creator: khr::Swapchain,
+    vol: Option<Volatile>,
+
+    acquired_idx: Option<u32>,
+}
+
+// Components of the swapchain that will be nonexistent during recreation.
+// The point of this is that I can .take() all the components that need to be
+// destroyed during swapchain recreation, and therefore make sure noone tries
+// to access the briefly-void vulkan pointers.
+
+struct Volatile {
     swapchain: vk::SwapchainKHR,
     swapchain_image_views: Vec<vk::ImageView>,
     swapchain_dims: vk::Extent2D,
     framebuffers: Vec<vk::Framebuffer>,
-
-    acquired_idx: Option<u32>,
 }
 
 impl Vindow {
@@ -62,10 +71,12 @@ impl Vindow {
             surface,
 
             swapchain_creator,
-            swapchain,
-            swapchain_image_views,
-            swapchain_dims,
-            framebuffers,
+            vol: Some(Volatile {
+                swapchain,
+                swapchain_image_views,
+                swapchain_dims,
+                framebuffers,
+            }),
 
             acquired_idx: None,
         }
@@ -79,7 +90,7 @@ impl Vindow {
 
         let acquire_result = unsafe {
             self.swapchain_creator.acquire_next_image(
-                self.swapchain,
+                self.vol.as_ref().unwrap().swapchain,
                 std::u64::MAX,
                 semaphore,
                 vk::Fence::null(),
@@ -88,18 +99,22 @@ impl Vindow {
 
         let image_index = match acquire_result {
             Ok((image_idx, _is_sub_optimal)) => image_idx,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => panic!("Swapchain out of date!"),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.recreate();
+                self.acquire(semaphore);
+                self.acquired_idx.unwrap()
+            },
             Err(e) => panic!("Unexpected error during acquire_next_image: {}", e),
         };
 
         self.acquired_idx = Some(image_index);
 
-        (self.framebuffers[image_index as usize], self.swapchain_dims)
+        (self.vol.as_ref().unwrap().framebuffers[image_index as usize], self.vol.as_ref().unwrap().swapchain_dims)
     }
 
     pub fn present(&mut self, semaphore: vk::Semaphore) {
         let wait_semaphores = [semaphore];
-        let swapchains = [self.swapchain];
+        let swapchains = [self.vol.as_ref().unwrap().swapchain];
         let image_indices = [self.acquired_idx.expect("No acquired image index found when trying to present! Did you forget to acquire before presentation?")];
 
         let present_info = vk::PresentInfoKHR {
@@ -118,9 +133,40 @@ impl Vindow {
                 .queue_present(self.queue, &present_info)
         } {
             Ok(_idk_what_this_is) => {},
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => panic!("Swapchain out of date!"),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.recreate();
+            },
             Err(e) => panic!("Unexpected error during queue_present: {}", e),
         }
+    }
+
+    fn recreate(&mut self) {
+        let vol = self.vol.take().unwrap();
+        cleanup_swapchain(
+            &self.device,
+            &self.swapchain_creator,
+            vol.swapchain,
+            vol.framebuffers,
+            vol.swapchain_image_views,
+        );
+
+        let (swapchain, swapchain_images, swapchain_dims) = create_swapchain(
+            self.physical_device,
+            &self.surface_loader,
+            self.surface,
+            &self.swapchain_creator,
+        );
+
+        let swapchain_image_views = create_swapchain_image_views(&self.device, &swapchain_images);
+
+        let framebuffers = create_framebuffers(&self.device, self.render_pass, swapchain_dims, &swapchain_image_views);
+
+        self.vol = Some(Volatile {
+            swapchain,
+            swapchain_image_views,
+            swapchain_dims,
+            framebuffers
+        });
     }
 }
 
@@ -265,3 +311,31 @@ fn create_swapchain_image_views(
         })
         .collect()
 }
+
+fn cleanup_swapchain(
+    device: &Device,
+    swapchain_creator: &khr::Swapchain,
+    swapchain: vk::SwapchainKHR,
+    framebuffers: Vec<vk::Framebuffer>,
+    swapchain_image_views: Vec<vk::ImageView>,
+) {
+    unsafe {
+        device
+            .device_wait_idle()
+            .expect("Couldn't wait on device idle")
+    };
+
+    // destroy framebuffers
+    framebuffers
+        .iter()
+        .for_each(|&fb| unsafe { device.destroy_framebuffer(fb, None) });
+
+    // destroy swapchain image views
+    swapchain_image_views
+        .iter()
+        .for_each(|&view| unsafe { device.destroy_image_view(view, None) });
+
+    // destroy swapchain
+    unsafe { swapchain_creator.destroy_swapchain(swapchain, None) };
+}
+
