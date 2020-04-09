@@ -340,6 +340,7 @@ pub fn main() {
     }
 
     renderer.cleanup();
+    vindow.cleanup();
 
     drop(mesh_recv);
     println!("waiting on mesh thread");

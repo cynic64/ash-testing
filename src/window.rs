@@ -140,6 +140,22 @@ impl Vindow {
         }
     }
 
+    pub fn cleanup(mut self) {
+        let vol = self.vol.take().expect("Volatile swapchain objects not present when trying to clean up");
+
+        unsafe {
+            vol.swapchain_image_views
+                .iter()
+                .for_each(|&view| self.device.destroy_image_view(view, None));
+
+            vol.framebuffers
+                .iter()
+                .for_each(|&fb| self.device.destroy_framebuffer(fb, None));
+
+            self.swapchain_creator.destroy_swapchain(vol.swapchain, None);
+        }
+    }
+
     fn recreate(&mut self) {
         let vol = self.vol.take().unwrap();
         cleanup_swapchain(
