@@ -191,30 +191,31 @@ pub fn main() {
     }
 
     // get logical device
-    let device_queue_create_info = vk::DeviceQueueCreateInfo {
+    let device_queue_create_infos = [vk::DeviceQueueCreateInfo {
         s_type: vk::StructureType::DEVICE_QUEUE_CREATE_INFO,
         p_next: ptr::null(),
         flags: vk::DeviceQueueCreateFlags::empty(),
         queue_family_index,
         queue_count: 1,
         p_queue_priorities: [1.0].as_ptr(),
-    };
+    }];
 
     let device_extensions_raw = get_device_extensions_raw();
+    let enabled_features = vk::PhysicalDeviceFeatures::builder().build();
 
     let device_create_info = vk::DeviceCreateInfo {
         s_type: vk::StructureType::DEVICE_CREATE_INFO,
         p_next: ptr::null(),
         flags: vk::DeviceCreateFlags::empty(),
         queue_create_info_count: 1,
-        p_queue_create_infos: [device_queue_create_info].as_ptr(),
+        p_queue_create_infos: device_queue_create_infos.as_ptr(),
         // not used by Vulkan anymore
         enabled_layer_count: 0,
         pp_enabled_layer_names: ptr::null(),
         // these are
         enabled_extension_count: device_extensions_raw.len() as u32,
         pp_enabled_extension_names: device_extensions_raw.as_ptr(),
-        p_enabled_features: &vk::PhysicalDeviceFeatures::builder().build(),
+        p_enabled_features: &enabled_features,
     };
 
     let device = unsafe {
