@@ -440,96 +440,65 @@ fn mesh_thread(
 }
 
 fn create_mesh(points: &[VkPos]) -> Mesh<Vertex> {
-    use lyon::math::Point;
-    use lyon::path::Path;
-    use lyon::tessellation::*;
-    use lyon_tessellation::{LineCap, StrokeOptions, StrokeTessellator};
+    create_square(0, 1.0, 0.0, 0.0)
+}
 
-    let mut builder = Path::builder();
+fn create_square(cur_depth: u32, scale: f32, x_off: f32, y_off: f32) -> Mesh<Vertex> {
+    if cur_depth >= 5 {
+        Mesh {
+            vertices: vec![
+                Vertex {
+                    position: [-1.0 * scale + x_off, -1.0 * scale + y_off],
+                    color: [1.0, 1.0, 1.0],
+                },
+                Vertex {
+                    position: [-1.0 * scale + x_off, 1.0 * scale + y_off],
+                    color: [1.0, 1.0, 1.0],
+                },
+                Vertex {
+                    position: [1.0 * scale + x_off, -1.0 * scale + y_off],
+                    color: [1.0, 1.0, 1.0],
+                },
+                Vertex {
+                    position: [1.0 * scale + x_off, 1.0 * scale + y_off],
+                    color: [1.0, 1.0, 1.0],
+                }],
+            indices: vec![0, 2, 3, 0, 1, 3],
+        }
+    } else {
+        let f = 1.0 / 3.0;
+        combine_meshes(vec![
+            create_square(cur_depth + 1, scale * f, x_off + (-2.0 * scale * f), y_off + (-2.0 * scale * f)),
+            create_square(cur_depth + 1, scale * f, x_off + (-2.0 * scale * f), y_off + ( 0.0 * scale * f)),
+            create_square(cur_depth + 1, scale * f, x_off + (-2.0 * scale * f), y_off + ( 2.0 * scale * f)),
+            create_square(cur_depth + 1, scale * f, x_off + ( 0.0 * scale * f), y_off + ( 2.0 * scale * f)),
+            create_square(cur_depth + 1, scale * f, x_off + ( 0.0 * scale * f), y_off + (-2.0 * scale * f)),
+            create_square(cur_depth + 1, scale * f, x_off + ( 2.0 * scale * f), y_off + (-2.0 * scale * f)),
+            create_square(cur_depth + 1, scale * f, x_off + ( 2.0 * scale * f), y_off + ( 0.0 * scale * f)),
+            create_square(cur_depth + 1, scale * f, x_off + ( 2.0 * scale * f), y_off + ( 2.0 * scale * f)),
+        ])
+    }
+}
 
-    // need at least 2 points
-    if points.len() < 2 {
-        return Mesh {
+fn combine_meshes<V: Clone>(meshes: Vec<Mesh<V>>) -> Mesh<V> {
+    meshes
+        .iter()
+        .fold(Mesh {
             vertices: vec![],
             indices: vec![],
-        };
-    }
-
-    // linearly extrapolate one point on either end of the point list to so we
-    // can actually draw the first and last point, rather than using them as
-    // guides for control points
-    // extrapolate backwards: a - (b - a) = 2a - b
-    let first_point = vec![[
-        2.0 * points[0][0] - points[1][0],
-        2.0 * points[0][1] - points[1][1],
-    ]];
-    // extrapolate forwards: b + (b - a) = 2b - a
-    let len = points.len();
-    let last_point = vec![[
-        2.0 * points[len - 1][0] - points[len - 2][0],
-        2.0 * points[len - 1][1] - points[len - 2][1],
-    ]];
-
-    let points: Vec<_> = first_point
-        .iter()
-        .chain(points)
-        .chain(&last_point)
-        .collect();
-
-    builder.move_to(vk_to_point(&points[1]));
-
-    // last point is used as a control point, and penultimate point is joined
-    // to, so only go to len - 2
-    for i in 1..points.len() - 2 {
-        // we join x and y, using w and z to dictate the control points (a and b)
-        let x = points[i];
-        let y = points[i + 1];
-        let w = points[i - 1];
-        let z = points[i + 2];
-
-        let a = [
-            x[0] + KINKINESS * y[0] - KINKINESS * w[0],
-            x[1] + KINKINESS * y[1] - KINKINESS * w[1],
-        ];
-        let b = [
-            y[0] - KINKINESS * z[0] + KINKINESS * x[0],
-            y[1] - KINKINESS * z[1] + KINKINESS * x[1],
-        ];
-
-        builder.cubic_bezier_to(vk_to_point(&a), vk_to_point(&b), vk_to_point(&y));
-    }
-
-    let path = builder.build();
-
-    // will contain the result of the tessellation.
-    let mut geometry: VertexBuffers<Vertex, IndexType> = VertexBuffers::new();
-    let mut tessellator = StrokeTessellator::new();
-    {
-        // compute the tessellation.
-        tessellator
-            .tessellate(
-                &path,
-                &StrokeOptions::DEFAULT
-                    .with_line_width(0.01)
-                    .with_tolerance(0.0001)
-                    .with_start_cap(LineCap::Round)
-                    .with_end_cap(LineCap::Round),
-                &mut BuffersBuilder::new(&mut geometry, |pos: Point, _: StrokeAttributes| Vertex {
-                    position: pos.to_array(),
-                    color: [
-                        pos.x * 0.5 + 0.5,
-                        pos.y * 0.5 + 0.5,
-                        (pos.x * 0.5 + 0.5) * (pos.y * 0.5 + 0.5),
-                    ],
-                }),
-            )
-            .unwrap();
-    }
-
-    Mesh {
-        vertices: geometry.vertices,
-        indices: geometry.indices,
-    }
+        }, |a: Mesh<V>, m: &Mesh<V>| {
+            let l = a.vertices.len() as u32;
+            Mesh {
+                vertices: [a.vertices, m.vertices.clone()].concat(),
+                indices: a.indices
+                    .into_iter()
+                    .chain(
+                        m.indices
+                            .iter()
+                            .map(|&idx| idx + l))
+                    .collect(),
+            }
+        })
 }
 
 fn create_debug_points() -> Vec<VkPos> {
