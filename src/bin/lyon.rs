@@ -21,7 +21,7 @@ use std::ptr;
 use memoffset::offset_of;
 
 use ash_testing::single_pipe_renderer::{Mesh, Renderer};
-use ash_testing::window::Vindow;
+use ash_testing::window::{Vindow, DimsHandle};
 use ash_testing::{relative_path, LoopTimer};
 
 #[cfg(target_os = "macos")]
@@ -271,6 +271,8 @@ pub fn main() {
         surface,
     );
 
+    let dims_handle = vindow.get_dims_handle();
+
     // pipeline layout
     let pipeline_layout = create_pipeline_layout(&device);
 
@@ -298,10 +300,7 @@ pub fn main() {
     // spawn it
     let mesh_gen_handle = std::thread::spawn(move || {
         // dummy extent value for now
-        mesh_thread(mesh_send, event_recv, hidpi_factor, vk::Extent2D {
-            width: 1000,
-            height: 1000,
-        })
+        mesh_thread(mesh_send, event_recv, hidpi_factor, dims_handle)
     });
 
     let mut renderer = Renderer::new(
@@ -370,7 +369,7 @@ fn mesh_thread(
     mesh_send: Sender<Mesh<Vertex>>,
     event_recv: Receiver<WindowEvent>,
     hidpi_factor: f64,
-    swapchain_dims: vk::Extent2D,
+    dims_handle: DimsHandle,
 ) {
     let mut timer = LoopTimer::new("Mesh generation".to_string());
 
@@ -385,6 +384,8 @@ fn mesh_thread(
 
     loop {
         timer.start();
+
+        let swapchain_dims = *dims_handle.read().unwrap();
 
         event_recv.try_iter().for_each(|ev| match ev {
             WindowEvent::CursorMoved {

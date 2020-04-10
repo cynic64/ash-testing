@@ -4,8 +4,11 @@ use ash::{Device, Instance};
 use ash::version::DeviceV1_0;
 
 use std::ptr;
+use std::sync::{Arc, RwLock};
 
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
+
+pub type DimsHandle = Arc<RwLock<vk::Extent2D>>;
 
 pub struct Vindow {
     // taken
@@ -23,6 +26,12 @@ pub struct Vindow {
     vol: Option<Volatile>,
 
     acquired_idx: Option<u32>,
+
+    // It is convenient to access the current swapchain dimensions from any
+    // thread, especially for the user. To facilitate this, this RwLock can
+    // be cloned and read from anywhere and will be updated whenever the
+    // swapchain is recreated.
+    cur_swapchain_dims: DimsHandle,
 }
 
 // Components of the swapchain that will be nonexistent during recreation.
@@ -79,6 +88,8 @@ impl Vindow {
             }),
 
             acquired_idx: None,
+
+            cur_swapchain_dims: Arc::new(RwLock::new(swapchain_dims)),
         }
     }
 
@@ -173,6 +184,10 @@ impl Vindow {
             &self.swapchain_creator,
         );
 
+        let mut w = self.cur_swapchain_dims.write().unwrap();
+        *w = swapchain_dims;
+        drop(w);
+
         let swapchain_image_views = create_swapchain_image_views(&self.device, &swapchain_images);
 
         let framebuffers = create_framebuffers(&self.device, self.render_pass, swapchain_dims, &swapchain_image_views);
@@ -183,6 +198,10 @@ impl Vindow {
             swapchain_dims,
             framebuffers
         });
+    }
+
+    pub fn get_dims_handle(&self) -> DimsHandle {
+        self.cur_swapchain_dims.clone()
     }
 }
 
