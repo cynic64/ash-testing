@@ -444,7 +444,7 @@ fn create_mesh(points: &[VkPos]) -> Mesh<Vertex> {
 }
 
 fn create_square(cur_depth: u32, scale: f32, x_off: f32, y_off: f32) -> Mesh<Vertex> {
-    if cur_depth >= 5 {
+    if cur_depth >= 6 {
         Mesh {
             vertices: vec![
                 Vertex {

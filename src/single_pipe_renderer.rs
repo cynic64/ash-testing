@@ -32,9 +32,6 @@ const MAX_FRAMES_IN_FLIGHT: usize = 4;
 
 const LOG_LEVEL: log::LevelFilter = log::LevelFilter::Trace;
 
-const VBUF_CAPACITY: DeviceSize = 1_000_000;
-const IBUF_CAPACITY: DeviceSize = 1_000_000;
-
 struct FlyingFrame {
     id: String,
 
@@ -43,8 +40,10 @@ struct FlyingFrame {
     render_pass: vk::RenderPass,
     pipeline: vk::Pipeline,
     command_pool: vk::CommandPool,
+    device_memory_properties: vk::PhysicalDeviceMemoryProperties,
 
-    mesh_buffer: MeshBuffer,
+    // the mesh buffer may be .take()n during recreation
+    mesh_buffer: Option<MeshBuffer>,
 
     image_available_semaphore: vk::Semaphore,
     render_finished_semaphore: vk::Semaphore,
@@ -58,8 +57,10 @@ struct FlyingFrame {
 struct MeshBuffer {
     vertex: vk::Buffer,
     vertex_memory: vk::DeviceMemory,
+    vertex_capacity: DeviceSize,
     index: vk::Buffer,
     index_memory: vk::DeviceMemory,
+    index_capacity: DeviceSize,
 }
 
 impl Renderer {
@@ -118,7 +119,7 @@ impl Renderer {
         // assumes the mesh is different every frame, so will always copy its
         // data to the GPU
 
-        info!("EVENT 'New Frame'");
+        info!("BEGIN 'Draw'");
 
         let events = self.collect_events();
 
@@ -131,7 +132,7 @@ impl Renderer {
         info!("END 'FF {} Wait'", self.flying_frames[ff_idx].id);
 
         // write to buffers
-        let buffers = self.flying_frames[ff_idx].get_mesh_buffer();
+        let buffers = self.flying_frames[ff_idx].get_mesh_buffer(&mesh);
 
         info!("BEGIN 'Writing Buffers'");
         write_to_cpu_accessible_buffer(&self.device, buffers.vertex_memory, &mesh.vertices);
@@ -152,6 +153,8 @@ impl Renderer {
         info!("END 'Creation/Submission'");
 
         self.frames_drawn += 1;
+
+        info!("END 'Draw'");
 
         (events, render_finished_semaphore)
     }
@@ -224,8 +227,10 @@ impl FlyingFrame {
         let mesh_buffer = MeshBuffer::new(
             &device,
             device_memory_properties,
-            VBUF_CAPACITY,
-            IBUF_CAPACITY,
+            // initialize the meshbuffer with buffers of capacity 1, they will
+            // be scaled later
+            1,
+            1,
         );
 
         Self {
@@ -235,8 +240,9 @@ impl FlyingFrame {
             render_pass,
             pipeline,
             command_pool,
+            device_memory_properties,
 
-            mesh_buffer,
+            mesh_buffer: Some(mesh_buffer),
 
             image_available_semaphore,
             render_finished_semaphore,
@@ -329,14 +335,33 @@ impl FlyingFrame {
         self.image_available_semaphore
     }
 
-    fn get_mesh_buffer(&self) -> MeshBuffer {
-        // There is no safeguard to prevent you from using the MeshBuffer when
+    fn get_mesh_buffer<V>(&mut self, mesh: &Mesh<V>) -> MeshBuffer {
+        // there is no safeguard to prevent you from using the MeshBuffer when
         // you shouldn't, so be careful
-        self.mesh_buffer.clone()
+
+        // will re-create the mesh buffer if it is too small
+        let (vsize, isize) = (size_of_slice(&mesh.vertices), size_of_slice(&mesh.indices));
+        let (vcap, icap) = (self.mesh_buffer.as_ref().unwrap().vertex_capacity, self.mesh_buffer.as_ref().unwrap().index_capacity);
+
+        if vsize > vcap || isize > icap {
+            info!("Scaling buffer from ({}, {}) to ({}, {})",
+                vcap, icap, vsize, isize);
+
+            self.mesh_buffer.take().unwrap().cleanup(&self.device);
+
+            self.mesh_buffer = Some(MeshBuffer::new(
+                &self.device,
+                self.device_memory_properties,
+                vsize,
+                isize,
+            ));
+        }
+
+        self.mesh_buffer.as_ref().unwrap().clone()
     }
 
-    fn cleanup(self) {
-        self.mesh_buffer.cleanup(&self.device);
+    fn cleanup(mut self) {
+        self.mesh_buffer.take().unwrap().cleanup(&self.device);
 
         unsafe {
             self.device
@@ -555,13 +580,13 @@ impl MeshBuffer {
     fn new(
         device: &Device,
         device_memory_properties: vk::PhysicalDeviceMemoryProperties,
-        vbuf_capacity: vk::DeviceSize,
-        ibuf_capacity: vk::DeviceSize,
+        vertex_capacity: vk::DeviceSize,
+        index_capacity: vk::DeviceSize,
     ) -> Self {
         let (vertex, vertex_memory) = create_buffer(
             device,
             device_memory_properties,
-            vbuf_capacity,
+            vertex_capacity,
             vk::BufferUsageFlags::VERTEX_BUFFER,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         );
@@ -569,7 +594,7 @@ impl MeshBuffer {
         let (index, index_memory) = create_buffer(
             device,
             device_memory_properties,
-            ibuf_capacity,
+            index_capacity,
             vk::BufferUsageFlags::INDEX_BUFFER,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         );
@@ -577,8 +602,10 @@ impl MeshBuffer {
         Self {
             vertex,
             vertex_memory,
+            vertex_capacity,
             index,
             index_memory,
+            index_capacity,
         }
     }
 
